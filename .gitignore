@@ -57,6 +57,10 @@ data/processed/
 *.log
 logs/
 
+# Generated diff/patch artifacts
+*.patch
+*.diff
+
 # Environment variables
 .env
 .env.local
