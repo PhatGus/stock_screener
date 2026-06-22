@@ -9,28 +9,152 @@ import numpy as np
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 import time
+import random
 import warnings
+
+try:
+    import requests
+except Exception:  # pragma: no cover
+    requests = None
+
+try:
+    from ticker_cache import TickerCache
+except Exception:  # pragma: no cover - cache is optional
+    TickerCache = None
+
 warnings.filterwarnings('ignore')
+
+# Rotating pool of realistic browser User-Agent strings.  Rotating the UA (and a
+# couple of correlated headers) between fetches reduces the chance Yahoo
+# fingerprints the client and rate-limits the whole session at once.
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:123.0) "
+    "Gecko/20100101 Firefox/123.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.3 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) "
+    "Gecko/20100101 Firefox/122.0",
+]
+
+ACCEPT_LANGUAGES = ["en-US,en;q=0.9", "en-GB,en;q=0.8", "en-US,en;q=0.7"]
+
 
 class StockDataFetcher:
     """Fetches and processes stock data from yfinance"""
 
-    def __init__(self, rate_limit_delay: float = 0.2):
+    def __init__(self, rate_limit_delay: float = 0.2,
+                 min_ticker_delay: float = 1.5,
+                 max_ticker_delay: float = 2.0,
+                 batch_size: int = 25,
+                 batch_delay: float = 10.0,
+                 use_cache: bool = True,
+                 cache_max_age_hours: float = 24.0,
+                 cache_db_path: str = "ticker_cache.db",
+                 force_refresh: bool = False):
         """
         Initialize the data fetcher
 
         Args:
-            rate_limit_delay: Delay between API calls to avoid rate limiting
+            rate_limit_delay: Base delay used for retry/backoff timing
+            min_ticker_delay: Minimum delay (s) between individual ticker fetches
+            max_ticker_delay: Maximum delay (s) between individual ticker fetches
+            batch_size: Number of tickers fetched before pausing
+            batch_delay: Pause (s) between batches
+            use_cache: Whether to use the SQLite cross-run cache
+            cache_max_age_hours: Reuse cached tickers younger than this many hours
+            cache_db_path: Path to the SQLite cache database
         """
         self.rate_limit_delay = rate_limit_delay
         self.cache = {}
         self.error_count = 0
         self.max_retries = 3
+
+        # --- Rate-limit-avoidance configuration (Bug 2) ---
+        self.min_ticker_delay = min_ticker_delay
+        self.max_ticker_delay = max_ticker_delay
+        self.batch_size = batch_size
+        self.batch_delay = batch_delay
+
+        # --- SQLite cross-run cache (Bug 2) ---
+        self.use_cache = use_cache
+        # force_refresh skips cache *reads* (always re-fetch) but still writes
+        # fresh results back so later runs in the day stay fast.
+        self.force_refresh = force_refresh
+        self.cache_max_age_hours = cache_max_age_hours
+        self.cache_db = None
+        if use_cache and TickerCache is not None:
+            try:
+                self.cache_db = TickerCache(cache_db_path)
+            except Exception as e:
+                print(f"Could not open ticker cache ({e}); continuing without it.")
+                self.cache_db = None
+
+        # --- Rotating request session to avoid fingerprinting (Bug 2) ---
+        self.session = None
+        if requests is not None:
+            try:
+                self.session = requests.Session()
+            except Exception:
+                self.session = None
+
         # Extension hooks (off by default so existing behavior is unchanged).
         # Set enable_extended=True and provide voo_returns to fetch the new
         # Group A-E fields appended to each ticker dict.
         self.enable_extended = False
         self.voo_returns = None
+
+    @property
+    def cache_variant(self) -> str:
+        """Cache namespace: extended data must not be mixed with base data."""
+        return 'ext' if self.enable_extended else 'base'
+
+    def _rotate_headers(self) -> None:
+        """Apply a randomly chosen set of browser-like headers to the session."""
+        if self.session is None:
+            return
+        self.session.headers.update({
+            'User-Agent': random.choice(USER_AGENTS),
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': random.choice(ACCEPT_LANGUAGES),
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+        })
+
+    def _make_ticker(self, ticker: str):
+        """Construct a yf.Ticker with a rotated session (version-tolerant)."""
+        self._rotate_headers()
+        if self.session is not None:
+            try:
+                return yf.Ticker(ticker, session=self.session)
+            except TypeError:
+                # Older/newer yfinance may not accept a session kwarg.
+                return yf.Ticker(ticker)
+        return yf.Ticker(ticker)
+
+    @staticmethod
+    def _report(progress_callback, current: int, total: int, ticker: str,
+                eta_seconds: Optional[float]) -> None:
+        """Invoke a progress callback, tolerating 3- or 4-argument callbacks."""
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(current, total, ticker, eta_seconds)
+        except TypeError:
+            try:
+                progress_callback(current, total, ticker)
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def fetch_stock_data(self, ticker: str, period: str = "2y") -> Optional[Dict]:
         """
@@ -59,8 +183,8 @@ class StockDataFetcher:
                     print(f"Rate limited, waiting {wait_time}s before retry {attempt+1}/{self.max_retries}...")
                     time.sleep(wait_time)
 
-                # Fetch data from yfinance
-                stock = yf.Ticker(ticker)
+                # Fetch data from yfinance (rotating session headers)
+                stock = self._make_ticker(ticker)
 
                 # Get basic info
                 info = stock.info
@@ -372,7 +496,19 @@ class StockDataFetcher:
 
     def fetch_batch_data(self, tickers: List[str], progress_callback=None) -> pd.DataFrame:
         """
-        Fetch data for multiple tickers in batch
+        Fetch data for multiple tickers, using the SQLite cache and a
+        rate-limit-friendly batching strategy.
+
+        Strategy (Bug 2):
+          * Tickers with fresh cached data (< cache_max_age_hours) are loaded
+            from SQLite and never re-fetched.
+          * Remaining tickers are fetched in batches of ``batch_size`` with a
+            ``batch_delay`` pause between batches and a randomized
+            ``min_ticker_delay``-``max_ticker_delay`` pause between each ticker.
+          * Successful fetches are written back to the cache immediately, so an
+            interrupted run still benefits subsequent runs.
+          * ``progress_callback`` receives (current, total, ticker, eta_seconds);
+            3-argument callbacks are also supported.
 
         Args:
             tickers: List of ticker symbols
@@ -384,13 +520,73 @@ class StockDataFetcher:
         results = []
         total = len(tickers)
 
-        for i, ticker in enumerate(tickers):
-            if progress_callback:
-                progress_callback(i + 1, total, ticker)
+        # --- 1. Serve fresh tickers from the cross-run cache ---
+        cached_map: Dict[str, Dict] = {}
+        if self.use_cache and self.cache_db is not None and not self.force_refresh:
+            try:
+                cached_map = self.cache_db.get_many(
+                    tickers, variant=self.cache_variant,
+                    max_age_hours=self.cache_max_age_hours,
+                )
+            except Exception as e:
+                print(f"Cache read failed ({e}); fetching everything fresh.")
+                cached_map = {}
 
-            data = self.fetch_stock_data(ticker)
-            if data:
-                results.append(data)
+        to_fetch = []
+        for ticker in tickers:
+            if ticker in cached_map:
+                results.append(cached_map[ticker])
+            else:
+                to_fetch.append(ticker)
+
+        cached_count = len(results)
+        if cached_count:
+            print(f"Loaded {cached_count}/{total} tickers from cache; "
+                  f"fetching {len(to_fetch)} from Yahoo Finance.")
+        # Report cached items as already complete so the bar starts populated.
+        if cached_count and progress_callback:
+            last_cached = next((t for t in tickers if t in cached_map), tickers[0])
+            self._report(progress_callback, cached_count, total, last_cached, 0.0)
+
+        # --- 2. Fetch the rest in delayed batches ---
+        start_time = time.time()
+        fetched = 0
+        for batch_start in range(0, len(to_fetch), self.batch_size):
+            batch = to_fetch[batch_start:batch_start + self.batch_size]
+
+            for ticker in batch:
+                data = self.fetch_stock_data(ticker)
+                fetched += 1
+                current = cached_count + fetched
+
+                if data:
+                    results.append(data)
+                    if self.use_cache and self.cache_db is not None:
+                        try:
+                            self.cache_db.set(ticker, data, variant=self.cache_variant)
+                        except Exception as e:
+                            print(f"Cache write failed for {ticker}: {e}")
+
+                # Estimate time remaining from the live fetch rate.
+                elapsed = time.time() - start_time
+                rate = fetched / elapsed if elapsed > 0 else 0
+                remaining = len(to_fetch) - fetched
+                eta = (remaining / rate) if rate > 0 else None
+                # Account for the batch pauses still to come.
+                if eta is not None and self.batch_size > 0:
+                    pending_batches = remaining // self.batch_size
+                    eta += pending_batches * self.batch_delay
+                self._report(progress_callback, current, total, ticker, eta)
+
+                # Per-ticker delay (randomized to look less robotic).
+                if fetched < len(to_fetch):
+                    time.sleep(random.uniform(self.min_ticker_delay, self.max_ticker_delay))
+
+            # Pause between batches (skip after the final batch).
+            if batch_start + self.batch_size < len(to_fetch):
+                print(f"  Batch complete ({cached_count + fetched}/{total}); "
+                      f"pausing {self.batch_delay}s to avoid rate limiting...")
+                time.sleep(self.batch_delay)
 
         return pd.DataFrame(results)
 

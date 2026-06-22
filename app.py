@@ -73,6 +73,20 @@ def format_percentage(num: float) -> str:
     return f"{num:.1f}%"
 
 
+def format_eta(seconds: Optional[float]) -> str:
+    """Format an estimated-time-remaining value as a human-readable string."""
+    if seconds is None or seconds < 0:
+        return "calculating..."
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, secs = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {secs:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"
+
+
 def color_revenue_growth(val):
     """Color code revenue growth values"""
     if pd.isna(val):
@@ -107,8 +121,15 @@ def main():
         index=0,
         help="Choose the set of stocks to screen"
     )
-    tickers = universe_options[selected_universe]
-    st.sidebar.info(f"📊 Screening {len(tickers)} stocks")
+    tickers = universe_options.get(selected_universe)
+    # Guard against a universe source returning None/empty (e.g. a failed
+    # network fetch or a list builder that forgot to return) so we never call
+    # len() on None.
+    if not tickers:
+        tickers = []
+        st.sidebar.warning(f"⚠️ No tickers available for '{selected_universe}'.")
+    else:
+        st.sidebar.info(f"📊 Screening {len(tickers)} stocks")
 
     # Revenue growth criteria
     st.sidebar.subheader("Growth Metrics")
@@ -305,13 +326,27 @@ def run_screening(
     progress_bar = st.progress(0)
     status_text = st.empty()
 
-    def update_progress(current, total, ticker):
-        progress = current / total
-        progress_bar.progress(progress)
-        status_text.text(f"Fetching data: {ticker} ({current}/{total})")
+    def update_progress(current, total, ticker, eta_seconds=None):
+        progress = (current / total) if total else 0
+        progress_bar.progress(min(max(progress, 0.0), 1.0))
+        msg = f"Fetching {current}/{total}: {ticker}"
+        if eta_seconds is not None:
+            msg += f"  •  ~{format_eta(eta_seconds)} remaining"
+        status_text.text(msg)
 
-    # Initialize screener
-    fetcher = StockDataFetcher(rate_limit_delay=0.1)  # Balanced for reliability
+    # Initialize screener with rate-limit-friendly fetching + SQLite caching.
+    # refresh_cache (Force refresh data) bypasses the cache for this run but
+    # still writes fresh results back so later runs in the day stay fast.
+    fetcher = StockDataFetcher(
+        rate_limit_delay=0.1,
+        min_ticker_delay=1.5,
+        max_ticker_delay=2.0,
+        batch_size=25,
+        batch_delay=10.0,
+        use_cache=True,
+        cache_max_age_hours=24.0,
+        force_refresh=refresh_cache,
+    )
     screener = GrowthStockScreener(fetcher, use_edgar=use_edgar)
 
     # Run screening

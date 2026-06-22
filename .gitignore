@@ -57,6 +57,11 @@ data/processed/
 *.log
 logs/
 
+# Local caches / databases
+*.db
+*.sqlite
+*.sqlite3
+
 # Generated diff/patch artifacts
 *.patch
 *.diff

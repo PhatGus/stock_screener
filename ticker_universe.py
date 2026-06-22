@@ -123,6 +123,8 @@ def get_sp500_tickers():
         'D', 'PEG', 'PCG', 'EIX', 'FE', 'PPL', 'AEE', 'CMS', 'CNP', 'DTE'
     ]
 
+    return original
+
 def get_nasdaq100_additional():
     """
     Additional NASDAQ-100 tickers not in S&P 500
