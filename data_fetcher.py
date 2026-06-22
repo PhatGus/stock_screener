@@ -26,6 +26,11 @@ class StockDataFetcher:
         self.cache = {}
         self.error_count = 0
         self.max_retries = 3
+        # Extension hooks (off by default so existing behavior is unchanged).
+        # Set enable_extended=True and provide voo_returns to fetch the new
+        # Group A-E fields appended to each ticker dict.
+        self.enable_extended = False
+        self.voo_returns = None
 
     def fetch_stock_data(self, ticker: str, period: str = "2y") -> Optional[Dict]:
         """
@@ -110,6 +115,21 @@ class StockDataFetcher:
                 # Get analyst sentiment (now passes stock object)
                 analyst_sentiment = self._get_analyst_sentiment(stock)
                 data.update(analyst_sentiment)
+
+                # --- Extension: append new Group A-E fields (additive only) ---
+                # This reuses the already-constructed `stock` object and the
+                # per-ticker `data` dict, exactly as the existing fetches do.
+                if self.enable_extended:
+                    try:
+                        from screener_extension import fetch_extended_fields
+                        extended = fetch_extended_fields(
+                            stock, data, self.voo_returns, ticker,
+                            rate_limit_delay=0.5
+                        )
+                        data.update(extended)
+                    except Exception as ext_err:
+                        # Extension must never break the existing fetch.
+                        print(f"Extended fetch failed for {ticker}: {ext_err}")
 
                 # Cache the result
                 self.cache[cache_key] = (datetime.now(), data)
