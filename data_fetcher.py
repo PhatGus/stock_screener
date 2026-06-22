@@ -47,8 +47,14 @@ USER_AGENTS = [
 ACCEPT_LANGUAGES = ["en-US,en;q=0.9", "en-GB,en;q=0.8", "en-US,en;q=0.7"]
 
 
-class StockDataFetcher:
-    """Fetches and processes stock data from yfinance"""
+class YFinanceStockDataFetcher:
+    """Fetches and processes stock data from yfinance.
+
+    NOTE: As of the FMP migration this class is no longer the primary fetcher.
+    It is retained as a *fallback* in case FMP is unavailable.  The active
+    ``StockDataFetcher`` used by ``app.py`` / ``screener.py`` is re-exported at
+    the bottom of this module from ``fmp_fetcher`` (see below).
+    """
 
     def __init__(self, rate_limit_delay: float = 0.2,
                  min_ticker_delay: float = 1.5,
@@ -589,6 +595,27 @@ class StockDataFetcher:
                 time.sleep(self.batch_delay)
 
         return pd.DataFrame(results)
+
+
+# ---------------------------------------------------------------------------
+# Primary fetcher: Financial Modeling Prep (FMP)
+# ---------------------------------------------------------------------------
+# This module is now a thin wrapper: it re-exports the FMP fetcher as
+# ``StockDataFetcher`` so that ``app.py`` and ``screener.py`` keep importing
+# ``StockDataFetcher`` from here with no changes.  The yfinance implementation
+# above (``YFinanceStockDataFetcher``) is retained as a fallback.
+#
+# Behavior:
+#   * If ``fmp_fetcher`` imports cleanly, ``StockDataFetcher`` IS the FMP fetcher.
+#     A missing ``FMP_API_KEY`` then raises a clear RuntimeError at construction.
+#   * If ``fmp_fetcher`` cannot be imported at all (e.g. missing dependency),
+#     we fall back to the yfinance fetcher so the app still runs.
+try:
+    from fmp_fetcher import FMPStockDataFetcher as StockDataFetcher
+except ImportError as _fmp_import_err:  # pragma: no cover - fallback path
+    print(f"FMP fetcher unavailable ({_fmp_import_err}); "
+          f"falling back to yfinance fetcher.")
+    StockDataFetcher = YFinanceStockDataFetcher
 
 
 if __name__ == "__main__":
