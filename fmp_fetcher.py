@@ -569,10 +569,11 @@ class FMPStockDataFetcher:
             out['net_buyback_yield'] = np.nan
             out['shareholder_yield'] = np.nan
 
-        # Factors that require data not currently fetched (balance sheet,
-        # estimate-revision history, multi-quarter institutional ownership).
-        # Kept as explicit NaN placeholders so the schema is stable and the
-        # scoring engine simply excludes them per-ticker until populated.
+        # Factors sourced from balance sheet / estimate-revision / multi-quarter
+        # institutional ownership (each method handles its own errors -> NaN).
+        out.update(self._balance_sheet_factors(ticker))
+        out['revenue_estimate_revision'] = self._revenue_estimate_revision(ticker)
+        # Safety net: ensure keys exist even if a method shape changes.
         for _ph in ('revenue_estimate_revision', 'asset_growth',
                     'institutional_ownership_change', 'debt_trend'):
             out.setdefault(_ph, np.nan)
@@ -602,8 +603,8 @@ class FMPStockDataFetcher:
         # ---- Earnings surprises ----
         out.update(self._earnings_surprises(ticker))
 
-        # ---- Institutional ownership ----
-        out['institutional_ownership_pct'] = self._institutional_ownership(ticker, base)
+        # ---- Institutional ownership (level + QoQ change) ----
+        out.update(self._institutional_ownership(ticker, base))
 
         # ---- Short interest ----
         out.update(self._short_interest(ticker))
@@ -636,25 +637,79 @@ class FMPStockDataFetcher:
             out['earnings_beat_rate'] = round(beats / count * 100, 1)
         return out
 
-    def _institutional_ownership(self, ticker: str, base: Dict):
-        # Preferred: v4 symbol-ownership gives a direct percentage.
-        own = _first(self._get(V4_BASE, "institutional-ownership/symbol-ownership",
-                               ticker, {'symbol': ticker, 'includeCurrentQuarter': 'true'}))
-        if isinstance(own, dict):
-            pct = _num(own.get('ownershipPercent') or own.get('investorsHolding'))
-            if not pd.isna(_num(own.get('ownershipPercent'))):
-                # Expressed as a percent (e.g. 65.3) -> store as decimal.
-                return _num(own.get('ownershipPercent')) / 100
+    def _institutional_ownership(self, ticker: str, base: Dict) -> Dict:
+        """Institutional ownership level (decimal) and quarter-over-quarter
+        change in ownership percent, from /institutional-ownership."""
+        out = {'institutional_ownership_pct': np.nan,
+               'institutional_ownership_change': np.nan}
+        try:
+            own = self._get(V4_BASE, "institutional-ownership/symbol-ownership",
+                            ticker, {'symbol': ticker, 'includeCurrentQuarter': 'true'})
+            rows = own if isinstance(own, list) else ([own] if isinstance(own, dict) else [])
+            if rows:
+                rows = sorted(rows, key=lambda r: str(r.get('date', '')), reverse=True)
+                pct0 = _num(rows[0].get('ownershipPercent'))
+                if not pd.isna(pct0):
+                    # Expressed as a percent (e.g. 65.3) -> store as decimal.
+                    out['institutional_ownership_pct'] = pct0 / 100
+                # Delta in ownership percent between the two most recent quarters.
+                if len(rows) >= 2:
+                    pct1 = _num(rows[1].get('ownershipPercent'))
+                    if not pd.isna(pct0) and not pd.isna(pct1):
+                        out['institutional_ownership_change'] = (pct0 - pct1) / 100
 
-        # Fallback: sum holder shares / shares outstanding from /institutional-holder.
-        holders = self._get(V3_BASE, f"institutional-holder/{ticker}", ticker)
-        shares_out = _num(base.get('shares_outstanding'))
-        if isinstance(holders, list) and holders and not pd.isna(shares_out) and shares_out > 0:
-            total_held = sum(_num(h.get('shares')) for h in holders
-                             if not pd.isna(_num(h.get('shares'))))
-            if total_held > 0:
-                return min(1.0, total_held / shares_out)
+            # Fallback for the level: sum holder shares / shares outstanding.
+            if pd.isna(out['institutional_ownership_pct']):
+                holders = self._get(V3_BASE, f"institutional-holder/{ticker}", ticker)
+                shares_out = _num(base.get('shares_outstanding'))
+                if isinstance(holders, list) and holders and not pd.isna(shares_out) and shares_out > 0:
+                    total_held = sum(_num(h.get('shares')) for h in holders
+                                     if not pd.isna(_num(h.get('shares'))))
+                    if total_held > 0:
+                        out['institutional_ownership_pct'] = min(1.0, total_held / shares_out)
+        except Exception as e:
+            _log(ticker, 'institutional-ownership', str(e))
+        return out
+
+    def _balance_sheet_factors(self, ticker: str) -> Dict:
+        """asset_growth and debt_trend from /balance-sheet-statement (YoY change
+        in totalAssets / totalDebt between the two most recent periods)."""
+        out = {'asset_growth': np.nan, 'debt_trend': np.nan}
+        try:
+            bs = self._get(V3_BASE, f"balance-sheet-statement/{ticker}",
+                           ticker, {'limit': 5})
+            if isinstance(bs, list) and len(bs) >= 2:
+                ta0, ta1 = _num(bs[0].get('totalAssets')), _num(bs[1].get('totalAssets'))
+                if not pd.isna(ta0) and not pd.isna(ta1) and ta1 != 0:
+                    out['asset_growth'] = (ta0 - ta1) / abs(ta1)
+                td0, td1 = _num(bs[0].get('totalDebt')), _num(bs[1].get('totalDebt'))
+                if not pd.isna(td0) and not pd.isna(td1) and td1 != 0:
+                    out['debt_trend'] = (td0 - td1) / abs(td1)
+        except Exception as e:
+            _log(ticker, 'balance-sheet-statement', str(e))
+        return out
+
+    def _revenue_estimate_revision(self, ticker: str) -> float:
+        """Revision in consensus revenue estimate: % change in revenueAvg between
+        the two most recent estimate dates from /analyst-estimates."""
+        try:
+            est = self._get(V3_BASE, f"analyst-estimates/{ticker}", ticker)
+            if isinstance(est, list) and len(est) >= 2:
+                rows = sorted(est, key=lambda r: str(r.get('date', '')), reverse=True)
+
+                def _rev(row):
+                    v = row.get('estimatedRevenueAvg')
+                    if v is None:
+                        v = row.get('revenueAvg')
+                    return _num(v)
+
+                r0, r1 = _rev(rows[0]), _rev(rows[1])
+                if not pd.isna(r0) and not pd.isna(r1) and r1 != 0:
+                    return (r0 - r1) / abs(r1) * 100
+        except Exception as e:
+            _log(ticker, 'analyst-estimates(revision)', str(e))
         return np.nan
+
 
     def _short_interest(self, ticker: str) -> Dict:
         out = {'short_interest_pct_float': np.nan, 'short_ratio': np.nan}
