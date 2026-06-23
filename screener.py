@@ -38,6 +38,8 @@ HARD_GATE_MAX_FCF_MARGIN_FLOOR = -0.20
 HARD_GATE_MAX_EV_EBITDA = 60
 HARD_GATE_BIOTECH_PROXY_GROSS_MARGIN = 0.85
 HARD_GATE_BIOTECH_PROXY_MAX_REVENUE = 500_000_000
+HARD_GATE_ACTIVE_LISTING = True          # exclude inactive/delisted tickers
+HARD_GATE_MIN_FORWARD_REVENUE_GROWTH = 0.10  # 10% minimum forward revenue growth
 
 
 def apply_hard_gates(df: pd.DataFrame,
@@ -45,7 +47,9 @@ def apply_hard_gates(df: pd.DataFrame,
                      fcf_margin_floor: float = HARD_GATE_MAX_FCF_MARGIN_FLOOR,
                      max_ev_ebitda: float = HARD_GATE_MAX_EV_EBITDA,
                      biotech_gross_margin: float = HARD_GATE_BIOTECH_PROXY_GROSS_MARGIN,
-                     biotech_max_revenue: float = HARD_GATE_BIOTECH_PROXY_MAX_REVENUE):
+                     biotech_max_revenue: float = HARD_GATE_BIOTECH_PROXY_MAX_REVENUE,
+                     active_listing: bool = HARD_GATE_ACTIVE_LISTING,
+                     min_forward_revenue_growth: float = HARD_GATE_MIN_FORWARD_REVENUE_GROWTH):
     """Apply hard universe exclusion gates before scoring (Fix 1).
 
     Drops any ticker failing a gate, logs the reason to screener_errors.log, and
@@ -53,8 +57,8 @@ def apply_hard_gates(df: pd.DataFrame,
     dropped tickers (a ticker is attributed to the first gate it fails).
     """
     stats: Dict[str, List[str]] = {
-        'min_revenue_ttm': [], 'min_fcf_margin': [],
-        'max_ev_ebitda': [], 'revenue_source_proxy': [],
+        'active_listing': [], 'min_revenue_ttm': [], 'min_fcf_margin': [],
+        'max_ev_ebitda': [], 'revenue_source_proxy': [], 'min_forward_revenue_growth': [],
     }
     if df is None or df.empty:
         return df, stats
@@ -67,15 +71,28 @@ def apply_hard_gates(df: pd.DataFrame,
            if 'ev_ebitda' in df.columns else pd.Series(np.nan, index=df.index))
     gm = (pd.to_numeric(df['gross_margin'], errors='coerce')
           if 'gross_margin' in df.columns else pd.Series(np.nan, index=df.index))
+    active = (df['is_actively_trading'] if 'is_actively_trading' in df.columns
+              else pd.Series(True, index=df.index))
+    fwd_rev = (pd.to_numeric(df['forward_revenue_estimate'], errors='coerce')
+               if 'forward_revenue_estimate' in df.columns else pd.Series(np.nan, index=df.index))
+    # Forward revenue growth in percentage points (NaN when estimate/rev missing).
+    fwd_growth = (fwd_rev / rev.replace(0.0, np.nan) - 1.0) * 100
+    min_fwd_pct = min_forward_revenue_growth * 100  # constant stored as a decimal
 
     # Gate masks (True == FAIL -> drop).
+    fail_active = (active == False) if active_listing else pd.Series(False, index=df.index)  # noqa: E712
     fail_rev = rev.isna() | (rev <= 0) | (rev < min_revenue_ttm)
     fail_fcf = fcfm.notna() & (fcfm < fcf_margin_floor)
     fail_ev = eve.notna() & (eve > max_ev_ebitda)
     fail_bio = gm.notna() & rev.notna() & (gm > biotech_gross_margin) & (rev < biotech_max_revenue)
+    # NaN forward growth is NOT excluded here (handled by the conservative
+    # deceleration penalty in calculate_horizon_scores instead).
+    fail_fwd = fwd_growth.notna() & (fwd_growth < min_fwd_pct)
 
     keep = pd.Series(True, index=df.index)
     ordered = [
+        ('active_listing', fail_active,
+         lambda i: "delisted_or_inactive (isActivelyTrading=False)"),
         ('min_revenue_ttm', fail_rev,
          lambda i: f"revenue_ttm={rev.get(i)} (< {min_revenue_ttm:,.0f} or NaN/zero)"),
         ('min_fcf_margin', fail_fcf,
@@ -85,6 +102,8 @@ def apply_hard_gates(df: pd.DataFrame,
         ('revenue_source_proxy', fail_bio,
          lambda i: f"gross_margin={gm.get(i):.3f} & revenue_ttm={rev.get(i):,.0f} "
                    f"(GM>{biotech_gross_margin} & rev<{biotech_max_revenue:,.0f})"),
+        ('min_forward_revenue_growth', fail_fwd,
+         lambda i: f"forward_revenue_growth={fwd_growth.get(i):.1f}pp (< {min_fwd_pct:.1f}pp)"),
     ]
     for gate, fail_mask, reason_fn in ordered:
         hit = fail_mask & keep
@@ -281,6 +300,13 @@ def calculate_horizon_scores(df: pd.DataFrame) -> pd.DataFrame:
     df['forward_revenue_growth'] = (fwd_rev / rev_ttm.replace(0.0, np.nan) - 1.0) * 100
     df['growth_deceleration'] = df['forward_revenue_growth'] - rg
 
+    # Fix 5: when forward revenue growth is unknown (missing forward estimate),
+    # assume a CONSERVATIVE 20pp deceleration rather than skipping the penalty.
+    # This is a deliberate default, not a measured value; the row is flagged so
+    # it's visible which stocks are penalized on assumption vs measurement.
+    df['forward_estimate_missing'] = df['forward_revenue_growth'].isna()
+    df.loc[df['forward_estimate_missing'], 'growth_deceleration'] = -20.0
+
     # Preserve the prior single composite as composite_score_v2 (principle 4).
     df['composite_score_v2'] = pd.to_numeric(df.get('composite_score', np.nan), errors='coerce')
 
@@ -334,7 +360,9 @@ class GrowthStockScreener:
                  gate_fcf_margin_floor: float = HARD_GATE_MAX_FCF_MARGIN_FLOOR,
                  gate_max_ev_ebitda: float = HARD_GATE_MAX_EV_EBITDA,
                  gate_biotech_gross_margin: float = HARD_GATE_BIOTECH_PROXY_GROSS_MARGIN,
-                 gate_biotech_max_revenue: float = HARD_GATE_BIOTECH_PROXY_MAX_REVENUE):
+                 gate_biotech_max_revenue: float = HARD_GATE_BIOTECH_PROXY_MAX_REVENUE,
+                 gate_active_listing: bool = HARD_GATE_ACTIVE_LISTING,
+                 gate_min_forward_revenue_growth: float = HARD_GATE_MIN_FORWARD_REVENUE_GROWTH):
         """
         Initialize the screener
 
@@ -354,7 +382,10 @@ class GrowthStockScreener:
         self.gate_max_ev_ebitda = gate_max_ev_ebitda
         self.gate_biotech_gross_margin = gate_biotech_gross_margin
         self.gate_biotech_max_revenue = gate_biotech_max_revenue
+        self.gate_active_listing = gate_active_listing
+        self.gate_min_forward_revenue_growth = gate_min_forward_revenue_growth
         self.gate_stats: Dict[str, List[str]] = {}
+        self.delisted_excluded: List[str] = []
 
     def screen_stocks(
         self,
@@ -388,6 +419,26 @@ class GrowthStockScreener:
         # Get tickers to screen
         if tickers is None:
             tickers = get_full_universe()
+
+        # Fix 1: drop FMP-delisted tickers BEFORE fetching (saves API calls on
+        # dead tickers). Only runs when the fetcher exposes a delisted set.
+        self.delisted_excluded = []
+        get_delisted = getattr(self.fetcher, 'get_delisted_set', None)
+        if callable(get_delisted):
+            try:
+                delisted = get_delisted()
+                if delisted:
+                    before = len(tickers)
+                    kept_tickers = [t for t in tickers if str(t).upper() not in delisted]
+                    self.delisted_excluded = [t for t in tickers if str(t).upper() in delisted]
+                    for t in self.delisted_excluded:
+                        _gate_log(t, 'delisted_prefilter', 'in FMP delisted-companies set')
+                    if self.delisted_excluded:
+                        print(f"  Skipping {before - len(kept_tickers)} delisted tickers "
+                              f"before fetch")
+                    tickers = kept_tickers
+            except Exception as e:
+                print(f"Delisted pre-filter skipped: {e}")
 
         # Fetch data for all tickers
         print(f"Fetching data for {len(tickers)} tickers...")
@@ -465,6 +516,8 @@ class GrowthStockScreener:
                 max_ev_ebitda=self.gate_max_ev_ebitda,
                 biotech_gross_margin=self.gate_biotech_gross_margin,
                 biotech_max_revenue=self.gate_biotech_max_revenue,
+                active_listing=self.gate_active_listing,
+                min_forward_revenue_growth=self.gate_min_forward_revenue_growth,
             )
             dropped = before - len(df)
             if dropped:

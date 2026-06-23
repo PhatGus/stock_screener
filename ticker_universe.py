@@ -3,6 +3,123 @@ Ticker Universe Module
 Provides a curated list of liquid US-listed stocks for screening
 """
 
+import json
+import os
+import time
+
+try:
+    import requests
+except Exception:  # pragma: no cover
+    requests = None
+
+# Dynamic FMP universe (Fix 2)
+_FMP_V3 = "https://financialmodelingprep.com/api/v3"
+_FMP_UNIVERSE_CACHE = "fmp_universe_cache.json"
+_FMP_UNIVERSE_TTL = 24 * 3600  # 24 hours
+_FMP_EXCHANGES = {'NYSE', 'NASDAQ', 'AMEX'}
+
+
+def _fmp_delisted_set(api_key: str, session) -> set:
+    """Set of delisted ticker symbols from FMP (empty set on failure)."""
+    out = set()
+    try:
+        resp = session.get(f"{_FMP_V3}/delisted-companies",
+                           params={'apikey': api_key, 'limit': 5000}, timeout=15)
+        if resp.status_code == 200:
+            for row in resp.json() or []:
+                sym = row.get('symbol') if isinstance(row, dict) else None
+                if sym:
+                    out.add(str(sym).upper())
+    except Exception:
+        pass
+    return out
+
+
+def get_fmp_universe(min_market_cap: float = 1_000_000_000):
+    """Build the screening universe dynamically from FMP (Fix 2).
+
+    Fetches /stock/list, keeps NYSE/NASDAQ/AMEX common stocks (and applies a
+    market-cap floor when the list carries a market-cap field), removes any
+    FMP-delisted tickers, dedupes, and caches the result to
+    fmp_universe_cache.json with a 24-hour TTL.
+
+    Falls back to the static comprehensive_tickers list if the FMP fetch fails.
+    """
+    # Serve from the 24h cache when fresh and built for the same market-cap floor.
+    try:
+        if os.path.exists(_FMP_UNIVERSE_CACHE):
+            with open(_FMP_UNIVERSE_CACHE) as fh:
+                cached = json.load(fh)
+            fresh = (time.time() - cached.get('fetched_at', 0)) < _FMP_UNIVERSE_TTL
+            same = float(cached.get('min_market_cap', -1)) == float(min_market_cap)
+            if fresh and same and cached.get('tickers'):
+                return cached['tickers']
+    except Exception:
+        pass
+
+    api_key = os.environ.get('FMP_API_KEY')
+    if not api_key or requests is None:
+        return _fallback_universe()
+
+    try:
+        session = requests.Session()
+        resp = session.get(f"{_FMP_V3}/stock/list",
+                           params={'apikey': api_key}, timeout=30)
+        if resp.status_code != 200:
+            return _fallback_universe()
+        rows = resp.json()
+        if not isinstance(rows, list) or not rows:
+            return _fallback_universe()
+
+        delisted = _fmp_delisted_set(api_key, session)
+        seen = set()
+        tickers = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if row.get('exchangeShortName') not in _FMP_EXCHANGES:
+                continue
+            if str(row.get('type', '')).lower() != 'stock':
+                continue
+            sym = row.get('symbol')
+            if not sym or sym in seen:
+                continue
+            # /stock/list usually lacks market cap; filter only when present.
+            mc = row.get('marketCap')
+            if mc is not None:
+                try:
+                    if float(mc) < float(min_market_cap):
+                        continue
+                except (TypeError, ValueError):
+                    pass
+            if str(sym).upper() in delisted:
+                continue
+            seen.add(sym)
+            tickers.append(sym)
+
+        if not tickers:
+            return _fallback_universe()
+
+        try:
+            with open(_FMP_UNIVERSE_CACHE, 'w') as fh:
+                json.dump({'fetched_at': time.time(),
+                           'min_market_cap': float(min_market_cap),
+                           'tickers': tickers}, fh)
+        except Exception:
+            pass
+        return tickers
+    except Exception:
+        return _fallback_universe()
+
+
+def _fallback_universe():
+    """Static fallback when the FMP universe fetch is unavailable."""
+    try:
+        return get_full_universe()
+    except Exception:
+        return get_sp500_tickers()
+
+
 def get_additional_sp500():
     """Additional S&P 500 companies to complete the index"""
     return [

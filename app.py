@@ -13,7 +13,9 @@ from typing import List, Dict, Optional
 from data_fetcher import StockDataFetcher
 from screener import GrowthStockScreener
 from screener_extension import apply_macro_tags
-from ticker_universe import get_full_universe, get_sp500_tickers, get_nasdaq100_additional, get_high_growth_watchlist
+from ticker_universe import (get_full_universe, get_sp500_tickers,
+                             get_nasdaq100_additional, get_high_growth_watchlist,
+                             get_fmp_universe)
 
 # Page configuration
 st.set_page_config(
@@ -137,22 +139,44 @@ def main():
     # Sidebar for screening parameters
     st.sidebar.header("🎯 Screening Criteria")
 
-    # Universe selection
+    # Universe selection (Fix 2: FMP Live dynamic universe vs static file).
     st.sidebar.subheader("Stock Universe")
-    universe_options = load_universe_options()
-    selected_universe = st.sidebar.selectbox(
-        "Select stock universe",
-        list(universe_options.keys()),
-        index=0,
-        help="Choose the set of stocks to screen"
+    universe_source = st.sidebar.radio(
+        "Universe source",
+        options=['FMP Live', 'Static File'],
+        index=0,  # default FMP Live
+        horizontal=True,
+        help="FMP Live builds the universe dynamically from FMP; Static File uses the bundled lists",
     )
-    tickers = universe_options.get(selected_universe)
-    # Guard against a universe source returning None/empty (e.g. a failed
-    # network fetch or a list builder that forgot to return) so we never call
-    # len() on None.
+    mcap_choices = {'$500M': 500_000_000, '$1B': 1_000_000_000,
+                    '$5B': 5_000_000_000, '$10B': 10_000_000_000}
+    universe_min_mcap_label = st.sidebar.selectbox(
+        "Min market cap (universe)", list(mcap_choices.keys()), index=1,  # default $1B
+        help="Market-cap floor for the FMP Live universe",
+    )
+    universe_min_mcap = mcap_choices[universe_min_mcap_label]
+
+    if universe_source == 'FMP Live':
+        try:
+            tickers = get_fmp_universe(min_market_cap=universe_min_mcap)
+        except Exception as e:
+            tickers = []
+            st.sidebar.warning(f"⚠️ FMP universe fetch failed ({e}); using static fallback.")
+            tickers = get_full_universe()
+    else:
+        universe_options = load_universe_options()
+        selected_universe = st.sidebar.selectbox(
+            "Select stock universe",
+            list(universe_options.keys()),
+            index=0,
+            help="Choose the set of stocks to screen"
+        )
+        tickers = universe_options.get(selected_universe)
+
+    # Guard against a universe source returning None/empty so we never len(None).
     if not tickers:
         tickers = []
-        st.sidebar.warning(f"⚠️ No tickers available for '{selected_universe}'.")
+        st.sidebar.warning("⚠️ No tickers available for the selected universe.")
     else:
         st.sidebar.info(f"📊 Screening {len(tickers)} stocks")
 
@@ -290,9 +314,19 @@ def main():
             "Biotech proxy: revenue <", min_value=0.0, value=500_000_000.0, step=50_000_000.0,
             help="Drop if gross margin > threshold AND revenue below this",
         )
+        gate_min_forward_growth_pct = st.slider(
+            "Min forward revenue growth (%)", min_value=0.0, max_value=30.0,
+            value=10.0, step=1.0,
+            help="Drop tickers whose forward revenue growth is below this "
+                 "(NaN forward growth is kept and penalized instead)",
+        )
         exclude_flagged = st.checkbox(
             "Exclude SEC-flagged stocks", value=False,
             help="Hide tickers with sec_investigation_flag = True",
+        )
+        exclude_china_adr = st.checkbox(
+            "Exclude China ADRs", value=True,
+            help="Hide tickers flagged china_adr = True",
         )
 
     # Run screening button
@@ -316,7 +350,9 @@ def main():
             gate_max_ev_ebitda=gate_max_ev_ebitda,
             gate_biotech_gross_margin=gate_biotech_gross_margin,
             gate_biotech_max_revenue=gate_biotech_max_revenue,
+            gate_min_forward_revenue_growth=gate_min_forward_growth_pct / 100.0,
             exclude_flagged=exclude_flagged,
+            exclude_china_adr=exclude_china_adr,
         )
 
     # Horizon to sort the results table by (12m / 24m / 36m).
@@ -389,7 +425,9 @@ def run_screening(
     gate_max_ev_ebitda: float = 60.0,
     gate_biotech_gross_margin: float = 0.85,
     gate_biotech_max_revenue: float = 500_000_000.0,
+    gate_min_forward_revenue_growth: float = 0.10,
     exclude_flagged: bool = False,
+    exclude_china_adr: bool = True,
 ):
     """Run the stock screening process"""
 
@@ -433,6 +471,8 @@ def run_screening(
         gate_max_ev_ebitda=gate_max_ev_ebitda,
         gate_biotech_gross_margin=gate_biotech_gross_margin,
         gate_biotech_max_revenue=gate_biotech_max_revenue,
+        gate_active_listing=True,
+        gate_min_forward_revenue_growth=gate_min_forward_revenue_growth,
     )
 
     # Run screening
@@ -487,9 +527,13 @@ def run_screening(
                 except Exception as tag_err:
                     print(f"Macro tagging failed: {tag_err}")
 
-            # Optional filter: hide SEC-flagged stocks (Fix 4 — filter, not gate).
+            # Optional filter: hide SEC-flagged stocks (filter, not gate).
             if exclude_flagged and 'sec_investigation_flag' in results_df.columns:
                 results_df = results_df[results_df['sec_investigation_flag'] != True]  # noqa: E712
+
+            # Optional filter: hide China ADRs (Fix 4 — after gates, before display).
+            if exclude_china_adr and 'china_adr' in results_df.columns:
+                results_df = results_df[results_df['china_adr'] != True]  # noqa: E712
 
             # Store results in session state
             st.session_state.results_df = results_df
@@ -549,7 +593,7 @@ def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool,
     # Column selection based on show_scores setting and EDGAR availability
     if show_scores:
         display_columns = [
-            'ticker', 'company_name', 'sector', 'market_cap', 'current_price',
+            'ticker', 'company_name', 'sector', 'country', 'market_cap', 'current_price',
             'revenue_growth_yoy', 'revenue_growth_qoq', 'pe_ratio', 'forward_pe',
             'analyst_buy_percent', 'target_mean_price',
             'revenue_growth_score', 'forward_growth_score', 'valuation_score',
@@ -560,7 +604,7 @@ def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool,
         display_columns.extend(score_cols)
     else:
         display_columns = [
-            'ticker', 'company_name', 'sector', 'market_cap', 'current_price',
+            'ticker', 'company_name', 'sector', 'country', 'market_cap', 'current_price',
             'revenue_growth_yoy', 'forward_pe', 'analyst_buy_percent',
             'target_mean_price'
         ]
@@ -574,6 +618,8 @@ def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool,
         # Growth group
         'gross_margin', 'fcf_margin', 'fcf_yield', 'growth_deceleration',
         'earnings_beat_rate', 'eps_revision_net', 'rule_of_40',
+        # Sentiment group
+        'forward_estimate_missing',
         # Risk / flow group
         'short_interest_pct_float', 'insider_net_3m', 'insider_net_value_3m',
         'sec_investigation_flag', 'rate_sensitive', 'ai_infrastructure',
@@ -617,7 +663,8 @@ def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool,
             display_df[num_col] = pd.to_numeric(display_df[num_col], errors='coerce').round(ndigits)
 
     # Booleans displayed as-is (True/False).
-    for bool_col in ['rate_sensitive', 'ai_infrastructure', 'sec_investigation_flag']:
+    for bool_col in ['rate_sensitive', 'ai_infrastructure', 'sec_investigation_flag',
+                     'forward_estimate_missing']:
         if bool_col in display_df.columns:
             display_df[bool_col] = display_df[bool_col].astype('boolean')
 
@@ -644,6 +691,8 @@ def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool,
         'ticker': 'Ticker',
         'company_name': 'Company',
         'sector': 'Sector',
+        'country': 'Country',
+        'forward_estimate_missing': 'Fwd Est Missing',
         'market_cap': 'Market Cap',
         'current_price': 'Price',
         'revenue_growth_yoy': 'Rev Growth YoY %',

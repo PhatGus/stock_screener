@@ -55,6 +55,13 @@ SEC_FLAG_KEYWORDS = (
     'sec inquiry', 'subpoena', 'doj',
 )
 
+# China ADRs flagged regardless of the profile country field.
+CHINA_ADR_TICKERS = {
+    'BABA', 'JD', 'NTES', 'BIDU', 'PDD', 'TCOM',
+    'FUTU', 'TME', 'NIO', 'XPEV', 'LI', 'BILI',
+}
+CHINA_COUNTRIES = {'CN', 'China', 'HK', 'Hong Kong'}
+
 # ---------------------------------------------------------------------------
 # Logging (shared error log with the rest of the screener)
 # ---------------------------------------------------------------------------
@@ -169,6 +176,30 @@ class FMPStockDataFetcher:
         # data is requested we populate the extra fields natively from FMP.
         self.enable_extended = False
         self.voo_returns = None
+
+        # Delisted-companies set (fetched once, cached in memory — Fix 1).
+        self._delisted_set: Optional[set] = None
+
+    def get_delisted_set(self) -> set:
+        """Set of delisted ticker symbols from FMP (fetched once, cached).
+
+        Used to skip dead tickers before fetching their data. Returns an empty
+        set on any failure so the caller never breaks.
+        """
+        if self._delisted_set is not None:
+            return self._delisted_set
+        symbols = set()
+        try:
+            data = self._get(V3_BASE, "delisted-companies", "UNIVERSE", {'limit': 5000})
+            if isinstance(data, list):
+                for row in data:
+                    sym = row.get('symbol') if isinstance(row, dict) else None
+                    if sym:
+                        symbols.add(str(sym).upper())
+        except Exception as e:
+            _log('UNIVERSE', 'delisted-companies', str(e))
+        self._delisted_set = symbols
+        return symbols
 
     # ------------------------------------------------------------------
     # Cache variant + progress helpers (mirrors data_fetcher)
@@ -291,10 +322,21 @@ class FMPStockDataFetcher:
 
         profit_margin = _num(ratios.get('netProfitMarginTTM'))
 
+        # Fix 1: active-listing flag (default True when missing -> don't exclude).
+        active = profile.get('isActivelyTrading')
+        is_actively_trading = True if active is None else bool(active)
+
+        # Fix 4: country + China-ADR flag.
+        country = profile.get('country') or 'Unknown'
+        china_adr = (str(country).strip() in CHINA_COUNTRIES) or (ticker in CHINA_ADR_TICKERS)
+
         return {
             'company_name': profile.get('companyName') or quote.get('name') or ticker,
             'sector': profile.get('sector') or 'Unknown',
             'industry': profile.get('industry') or 'Unknown',
+            'country': country,
+            'is_actively_trading': is_actively_trading,
+            'china_adr': china_adr,
             'market_cap': _num(quote.get('marketCap') if quote.get('marketCap') is not None
                                else profile.get('mktCap')),
             'current_price': _num(quote.get('price') if quote.get('price') is not None
