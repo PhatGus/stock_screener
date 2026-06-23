@@ -10,6 +10,202 @@ from data_fetcher import StockDataFetcher
 from ticker_universe import get_full_universe, get_ticker_sectors
 from edgar_fetcher import EDGARDataFetcher, EDGARScreeningEnhancer
 
+# ===========================================================================
+# Horizon-based percentile-rank scoring engine
+# ===========================================================================
+# Principle (1): every factor is scored on its cross-sectional PERCENTILE RANK
+# across the current batch (0-100, 100 = best), via rank(pct=True)*100, so the
+# weights below behave as written regardless of factor distributions/outliers.
+#
+# Principle (2): sign discipline. 'low is good' factors have their rank inverted
+# (100 - rank). The set is asserted at scoring time.
+LOW_IS_GOOD = {
+    'forward_pe',          # listed as fwd_pe
+    'ev_ebitda',
+    'accruals_ratio',      # dropped from scoring (see consolidation) but signed here
+    'asset_growth',
+    'short_interest_pct_float',
+    'debt_trend',
+}
+
+# Principle (5): these are ranked WITHIN GICS sector (fallback to universe when a
+# sector has < 5 members in the batch).
+SECTOR_RANKED = {'gross_margin', 'fcf_margin'}
+
+# Factor -> family (used for the validation weight-by-family printout).
+FACTOR_FAMILY = {
+    'momentum_12_1': 'Momentum',
+    'eps_revision_net': 'Earnings momentum',
+    'revenue_estimate_revision': 'Earnings momentum',
+    'gross_margin': 'Quality',
+    'gross_margin_expansion': 'Quality',
+    'earnings_quality_ratio': 'Quality',
+    'net_margin_trend': 'Quality',
+    'fcf_margin': 'Profitability',
+    'fcf_yield': 'Value',
+    'ev_ebitda': 'Value',
+    'forward_pe': 'Value',
+    'capital_efficiency': 'Growth',
+    'asset_growth': 'Capital discipline',
+    'shareholder_yield': 'Capital return',
+    'net_buyback_yield': 'Capital return',
+    'institutional_ownership_change': 'Positioning',
+    'insider_net_3m': 'Positioning',
+    'short_interest_pct_float': 'Positioning',
+    'debt_trend': 'Risk',
+}
+
+# Principle (4)+(6): per-horizon raw weights. capital_efficiency replaces raw
+# revenue_growth_yoy in the score (5/6/7). Weights are normalized to sum to 100
+# before use. Keys are the actual dataframe column names ('forward_pe' == fwd_pe).
+HORIZON_WEIGHTS = {
+    '12m': {
+        'momentum_12_1': 14, 'eps_revision_net': 10, 'revenue_estimate_revision': 6,
+        'gross_margin': 6, 'gross_margin_expansion': 6, 'earnings_quality_ratio': 5,
+        'net_margin_trend': 4, 'fcf_margin': 6, 'fcf_yield': 4, 'ev_ebitda': 3,
+        'forward_pe': 3, 'capital_efficiency': 5, 'asset_growth': 4,
+        'shareholder_yield': 4, 'net_buyback_yield': 3,
+        'institutional_ownership_change': 4, 'insider_net_3m': 3,
+        'short_interest_pct_float': 2, 'debt_trend': 2,
+    },
+    '24m': {
+        'momentum_12_1': 7, 'eps_revision_net': 6, 'revenue_estimate_revision': 4,
+        'gross_margin': 7, 'gross_margin_expansion': 7, 'earnings_quality_ratio': 7,
+        'net_margin_trend': 5, 'fcf_margin': 8, 'fcf_yield': 7, 'ev_ebitda': 6,
+        'forward_pe': 5, 'capital_efficiency': 6, 'asset_growth': 7,
+        'shareholder_yield': 6, 'net_buyback_yield': 4,
+        'institutional_ownership_change': 3, 'insider_net_3m': 3,
+        'short_interest_pct_float': 2, 'debt_trend': 3,
+    },
+    '36m': {
+        'momentum_12_1': 3, 'eps_revision_net': 3, 'revenue_estimate_revision': 2,
+        'gross_margin': 8, 'gross_margin_expansion': 8, 'earnings_quality_ratio': 8,
+        'net_margin_trend': 6, 'fcf_margin': 9, 'fcf_yield': 9, 'ev_ebitda': 8,
+        'forward_pe': 7, 'capital_efficiency': 7, 'asset_growth': 9,
+        'shareholder_yield': 8, 'net_buyback_yield': 5,
+        'institutional_ownership_change': 2, 'insider_net_3m': 2,
+        'short_interest_pct_float': 2, 'debt_trend': 4,
+    },
+}
+
+HORIZONS = ('12m', '24m', '36m')
+
+
+def normalized_weights(horizon: str) -> Dict[str, float]:
+    """Weights for a horizon, scaled to sum to 100 (principle 4)."""
+    w = HORIZON_WEIGHTS[horizon]
+    total = float(sum(w.values()))
+    return {f: v / total * 100.0 for f, v in w.items()}
+
+
+def family_weights(horizon: str) -> Dict[str, float]:
+    """Effective normalized weight carried by each factor family in a horizon."""
+    fam: Dict[str, float] = {}
+    for f, w in normalized_weights(horizon).items():
+        fam[FACTOR_FAMILY[f]] = fam.get(FACTOR_FAMILY[f], 0.0) + w
+    return fam
+
+
+def _sector_aware_rank(df: pd.DataFrame, col: pd.Series, min_members: int = 5) -> pd.Series:
+    """Percentile rank within each sector; fall back to universe rank for
+    sectors with fewer than ``min_members`` members (principle 5)."""
+    universe = col.rank(pct=True) * 100
+    if 'sector' not in df.columns:
+        return universe
+    out = universe.copy()
+    sectors = df['sector'].fillna('Unknown')
+    for sec in sectors.unique():
+        idx = sectors.index[sectors == sec]
+        sub = col.loc[idx]
+        if sub.notna().sum() >= min_members:
+            out.loc[idx] = sub.rank(pct=True) * 100
+    return out
+
+
+def _factor_rank(df: pd.DataFrame, factor: str) -> pd.Series:
+    """Cross-sectional 0-100 percentile rank for a factor, with sign discipline
+    (low-is-good inverted) and optional sector normalization."""
+    if factor in df.columns:
+        col = pd.to_numeric(df[factor], errors='coerce')
+    else:
+        col = pd.Series(np.nan, index=df.index)
+    if factor in SECTOR_RANKED:
+        rank = _sector_aware_rank(df, col)
+    else:
+        rank = col.rank(pct=True) * 100
+    if factor in LOW_IS_GOOD:
+        rank = 100 - rank
+    return rank
+
+
+def _assert_factor_sign(df: pd.DataFrame, factor: str, rank: pd.Series) -> None:
+    """Assert each factor's rank carries the intended sign (principle 2).
+
+    Sector-ranked factors are skipped because within-sector ranking deliberately
+    breaks the global monotonic relationship between raw value and rank.
+    """
+    if factor in SECTOR_RANKED or factor not in df.columns:
+        return
+    raw = pd.to_numeric(df[factor], errors='coerce')
+    valid = raw.notna() & rank.notna()
+    if valid.sum() < 3 or raw[valid].nunique() < 2 or rank[valid].nunique() < 2:
+        return
+    corr = float(np.corrcoef(raw[valid].to_numpy(), rank[valid].to_numpy())[0, 1])
+    if np.isnan(corr):
+        return
+    if factor in LOW_IS_GOOD:
+        assert corr < 0, f"Sign error: '{factor}' is low-is-good but corr(raw, rank)={corr:.3f} >= 0"
+    else:
+        assert corr > 0, f"Sign error: '{factor}' is high-is-good but corr(raw, rank)={corr:.3f} <= 0"
+
+
+def calculate_horizon_scores(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute composite_score_12m/24m/36m from weighted percentile ranks.
+
+    Stores the previous composite as composite_score_v2 and aliases
+    composite_score to the 12m score for backward compatibility.
+    """
+    if df is None or df.empty:
+        return df
+    df = df.copy()
+
+    # Principle (6): capital-efficiency interaction = pct rank of
+    # revenue_growth_yoy / (1 + asset_growth). Missing asset_growth -> treated as
+    # 0 so the term degrades to growth alone rather than dropping out.
+    rg = pd.to_numeric(df.get('revenue_growth_yoy', np.nan), errors='coerce')
+    ag = pd.to_numeric(df.get('asset_growth', np.nan), errors='coerce').fillna(0.0)
+    ce_raw = rg / (1.0 + ag)
+    df['capital_efficiency'] = ce_raw.rank(pct=True) * 100
+
+    # Preserve the prior single composite as composite_score_v2 (principle 4).
+    df['composite_score_v2'] = pd.to_numeric(df.get('composite_score', np.nan), errors='coerce')
+
+    # Pre-compute every factor rank once (with sign + sector normalization).
+    factors = sorted(set().union(*[w.keys() for w in HORIZON_WEIGHTS.values()]))
+    ranks: Dict[str, pd.Series] = {}
+    for f in factors:
+        r = _factor_rank(df, f)
+        _assert_factor_sign(df, f, r)
+        ranks[f] = r
+
+    # Weighted average of available ranks per horizon (per-ticker renormalization
+    # over non-NaN factors keeps scores comparable when some factors are missing).
+    for hz in HORIZONS:
+        wn = normalized_weights(hz)
+        num = pd.Series(0.0, index=df.index)
+        den = pd.Series(0.0, index=df.index)
+        for f, w in wn.items():
+            r = ranks[f]
+            m = r.notna()
+            num[m] = num[m] + w * r[m]
+            den[m] = den[m] + w
+        df[f'composite_score_{hz}'] = (num / den.replace(0.0, np.nan)).round(2)
+
+    # Backward-compatible alias (existing code references composite_score).
+    df['composite_score'] = df['composite_score_12m']
+    return df
+
+
 class GrowthStockScreener:
     """Screen stocks based on growth metrics and other criteria"""
 
@@ -136,7 +332,13 @@ class GrowthStockScreener:
             # Recalculate composite score with EDGAR data
             df = self._calculate_scores_with_edgar(df)
 
-        # Sort by composite score
+        # Compute the three horizon scores (12m/24m/36m) from percentile ranks.
+        # This stores the prior composite as composite_score_v2 and aliases
+        # composite_score to the 12m score.
+        if len(df) > 0:
+            df = calculate_horizon_scores(df)
+
+        # Sort by composite score (12m by default)
         df = df.sort_values('composite_score', ascending=False)
 
         print(f"\nFinal result: {len(df)} stocks passed screening criteria")

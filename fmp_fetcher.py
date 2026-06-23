@@ -550,6 +550,33 @@ class FMPStockDataFetcher:
         else:
             out['rule_of_40'] = np.nan
 
+        # ---- Scoring-overhaul derived factors (no new fetches) ----
+        # Net margin trend: current vs prior-year net margin (from inc0/inc1).
+        nm0 = _safe_div(inc0.get('netIncome'), inc0.get('revenue'))
+        nm1 = _safe_div(inc1.get('netIncome'), inc1.get('revenue'))
+        out['net_margin_trend'] = (nm0 - nm1) if not pd.isna(nm0) and not pd.isna(nm1) else np.nan
+
+        # Shareholder yield + net buyback yield from cash flow + market cap.
+        # dividendsPaid / commonStockRepurchased are reported as negative outflows.
+        div_paid = _num(cf0.get('dividendsPaid'))
+        buyback = _num(cf0.get('commonStockRepurchased'))
+        if not pd.isna(market_cap) and market_cap and market_cap > 0:
+            div_amt = abs(div_paid) if not pd.isna(div_paid) else 0.0
+            bb_amt = abs(buyback) if not pd.isna(buyback) else 0.0
+            out['net_buyback_yield'] = bb_amt / market_cap
+            out['shareholder_yield'] = (div_amt + bb_amt) / market_cap
+        else:
+            out['net_buyback_yield'] = np.nan
+            out['shareholder_yield'] = np.nan
+
+        # Factors that require data not currently fetched (balance sheet,
+        # estimate-revision history, multi-quarter institutional ownership).
+        # Kept as explicit NaN placeholders so the schema is stable and the
+        # scoring engine simply excludes them per-ticker until populated.
+        for _ph in ('revenue_estimate_revision', 'asset_growth',
+                    'institutional_ownership_change', 'debt_trend'):
+            out.setdefault(_ph, np.nan)
+
         # ---- Valuation extras ----
         km = _first(self._get(V3_BASE, f"key-metrics-ttm/{ticker}", ticker)) or {}
         out['price_to_sales'] = _num(km.get('priceToSalesRatioTTM'))
@@ -672,6 +699,7 @@ class FMPStockDataFetcher:
             'relative_strength_vs_voo_6m': np.nan,
             'relative_strength_vs_voo_3m': np.nan,
             'volume_ratio_20d': np.nan,
+            'momentum_12_1': np.nan,
         }
         current_price = _num(base.get('current_price'))
 
@@ -685,6 +713,13 @@ class FMPStockDataFetcher:
                          ticker, {'timeseries': 400})
         closes = self._closes_from_history(hist)
         if closes is not None and len(closes) >= 2:
+            # 12-1 momentum: price return from ~12 months ago to ~1 month ago
+            # (excludes the most recent month to avoid short-term reversal).
+            p12 = self._price_at(closes, 12)
+            p1 = self._price_at(closes, 1)
+            if not pd.isna(p12) and p12 != 0 and not pd.isna(p1):
+                out['momentum_12_1'] = round((p1 / p12 - 1.0) * 100, 2)
+
             # Relative strength vs VOO if benchmark returns were preloaded.
             if self.voo_returns:
                 for months, key, voo_key in [
@@ -732,6 +767,15 @@ class FMPStockDataFetcher:
             return [float(r.get('volume', 0)) for r in rows]
         except Exception:
             return None
+
+    @staticmethod
+    def _price_at(closes: pd.Series, months: int) -> float:
+        """Close price as of ~``months`` months ago (last on/before the cutoff)."""
+        if closes is None or closes.empty:
+            return np.nan
+        cutoff = pd.Timestamp(closes.index[-1]) - pd.DateOffset(months=months)
+        past = closes[closes.index <= cutoff]
+        return float(past.iloc[-1]) if not past.empty else float(closes.iloc[0])
 
     @staticmethod
     def _period_return(closes: pd.Series, months: int) -> float:

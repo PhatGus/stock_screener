@@ -268,11 +268,21 @@ def main():
             use_edgar=use_edgar
         )
 
+    # Horizon to sort the results table by (12m / 24m / 36m).
+    st.sidebar.subheader("Ranking Horizon")
+    sort_horizon = st.sidebar.radio(
+        "Sort by",
+        options=['12m', '24m', '36m'],
+        index=0,  # default 12m
+        horizontal=True,
+        help="Which horizon score ranks the results table",
+    )
+
     # Main content area - default view
     if 'results_df' not in st.session_state:
         show_welcome_screen()
     else:
-        show_results(st.session_state.results_df, show_scores, export_csv)
+        show_results(st.session_state.results_df, show_scores, export_csv, sort_horizon)
 
 
 def show_welcome_screen():
@@ -429,12 +439,21 @@ def run_screening(
         status_text.empty()
 
 
-def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool):
+def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool,
+                 sort_horizon: str = '12m'):
     """Display screening results"""
 
     if df.empty:
         st.warning("No stocks found matching the criteria. Try adjusting the filters.")
         return
+
+    # Sort by the selected horizon score (falls back to composite_score).
+    score_cols = ['composite_score_12m', 'composite_score_24m', 'composite_score_36m']
+    sort_col = f'composite_score_{sort_horizon}'
+    if sort_col in df.columns:
+        df = df.sort_values(sort_col, ascending=False)
+    elif 'composite_score' in df.columns:
+        df = df.sort_values('composite_score', ascending=False)
 
     # Summary metrics
     col1, col2, col3, col4 = st.columns(4)
@@ -447,8 +466,9 @@ def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool):
         total_market_cap = df['market_cap'].sum()
         st.metric("Total Market Cap", format_large_number(total_market_cap))
     with col4:
-        avg_score = df['composite_score'].mean()
-        st.metric("Avg Score", f"{avg_score:.1f}")
+        avg_metric_col = sort_col if sort_col in df.columns else 'composite_score'
+        avg_score = df[avg_metric_col].mean() if avg_metric_col in df.columns else float('nan')
+        st.metric(f"Avg Score ({sort_horizon})", f"{avg_score:.1f}")
 
     st.markdown("---")
 
@@ -469,7 +489,7 @@ def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool):
         ]
         if has_edgar:
             display_columns.extend(['edgar_score', 'mda_sentiment', 'growth_mentions'])
-        display_columns.append('composite_score')
+        display_columns.extend(score_cols)
     else:
         display_columns = [
             'ticker', 'company_name', 'sector', 'market_cap', 'current_price',
@@ -478,7 +498,7 @@ def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool):
         ]
         if has_edgar:
             display_columns.extend(['mda_sentiment', 'edgar_score'])
-        display_columns.append('composite_score')
+        display_columns.extend(score_cols)
 
     # New FMP-derived columns to surface in the table (inserted just before the
     # composite score). Only those actually present in the dataframe are added.
@@ -488,8 +508,10 @@ def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool):
         'rule_of_40', 'rate_sensitive', 'ai_infrastructure',
     ]
     present_new = [c for c in new_fmp_columns if c in df.columns]
-    if 'composite_score' in display_columns:
-        idx = display_columns.index('composite_score')
+    # Insert just before the first horizon-score column.
+    insert_anchor = next((c for c in score_cols if c in display_columns), None)
+    if insert_anchor is not None:
+        idx = display_columns.index(insert_anchor)
         display_columns[idx:idx] = present_new
     else:
         display_columns.extend(present_new)
@@ -529,8 +551,16 @@ def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool):
     if 'target_mean_price' in display_df.columns:
         display_df['target_mean_price'] = display_df['target_mean_price'].apply(lambda x: f"${x:.2f}" if pd.notna(x) else "N/A")
 
+    # Keep the three horizon score columns numeric (for the color gradient).
+    for sc in score_cols:
+        if sc in display_df.columns:
+            display_df[sc] = pd.to_numeric(display_df[sc], errors='coerce').round(1)
+
     # Rename columns for display
     column_rename = {
+        'composite_score_12m': 'Score 12m',
+        'composite_score_24m': 'Score 24m',
+        'composite_score_36m': 'Score 36m',
         'ticker': 'Ticker',
         'company_name': 'Company',
         'sector': 'Sector',
@@ -569,30 +599,43 @@ def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool):
 
     display_df = display_df.rename(columns=column_rename)
 
+    # Color gradient (red = low, green = high) on the three horizon scores.
+    score_labels = [s for s in ['Score 12m', 'Score 24m', 'Score 36m']
+                    if s in display_df.columns]
+    table = display_df
+    if score_labels:
+        try:
+            table = display_df.style.background_gradient(
+                cmap='RdYlGn', subset=score_labels, vmin=0, vmax=100
+            ).format({lbl: '{:.1f}' for lbl in score_labels})
+        except Exception:
+            table = display_df  # fall back to unstyled if Styler unavailable
+
+    column_config = {
+        "Rev Growth YoY %": st.column_config.NumberColumn(
+            "Rev Growth YoY %",
+            help="Year-over-year revenue growth",
+            format="%.1f%%",
+        ),
+        "Buy %": st.column_config.NumberColumn(
+            "Buy %",
+            help="Percentage of analyst buy ratings",
+            format="%.0f%%",
+        ),
+    }
+    for lbl, hz in [('Score 12m', '12m'), ('Score 24m', '24m'), ('Score 36m', '36m')]:
+        if lbl in display_df.columns:
+            column_config[lbl] = st.column_config.NumberColumn(
+                lbl, help=f"{hz} horizon composite score (0-100, higher = better)",
+                format="%.1f",
+            )
+
     # Display the dataframe with formatting
     st.dataframe(
-        display_df,
+        table,
         use_container_width=True,
         height=600,
-        column_config={
-            "Rev Growth YoY %": st.column_config.NumberColumn(
-                "Rev Growth YoY %",
-                help="Year-over-year revenue growth",
-                format="%.1f%%",
-            ),
-            "Buy %": st.column_config.NumberColumn(
-                "Buy %",
-                help="Percentage of analyst buy ratings",
-                format="%.0f%%",
-            ),
-            "Score": st.column_config.ProgressColumn(
-                "Score",
-                help="Composite growth score (0-100)",
-                format="%.1f",
-                min_value=0,
-                max_value=100,
-            ),
-        },
+        column_config=column_config,
         hide_index=True,
     )
 
