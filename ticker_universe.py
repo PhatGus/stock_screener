@@ -16,7 +16,6 @@ except Exception:  # pragma: no cover
 _FMP_V3 = "https://financialmodelingprep.com/api/v3"
 _FMP_UNIVERSE_CACHE = "fmp_universe_cache.json"
 _FMP_UNIVERSE_TTL = 24 * 3600  # 24 hours
-_FMP_EXCHANGES = {'NYSE', 'NASDAQ', 'AMEX'}
 
 
 def _fmp_delisted_set(api_key: str, session) -> set:
@@ -63,35 +62,37 @@ def get_fmp_universe(min_market_cap: float = 1_000_000_000):
 
     try:
         session = requests.Session()
-        resp = session.get(f"{_FMP_V3}/stock/list",
-                           params={'apikey': api_key}, timeout=30)
+        # /stock-screener filters by market cap, exchange and active-trading
+        # status SERVER-SIDE (unlike /stock/list, which carries no market cap),
+        # so no local loop is needed for those fields.
+        resp = session.get(
+            f"{_FMP_V3}/stock-screener",
+            params={
+                'marketCapMoreThan': int(min_market_cap),
+                'exchangeShortName': 'NYSE,NASDAQ,AMEX',
+                'isActivelyTrading': 'true',
+                'limit': 10000,
+                'apikey': api_key,
+            },
+            timeout=30,
+        )
         if resp.status_code != 200:
             return _fallback_universe()
         rows = resp.json()
         if not isinstance(rows, list) or not rows:
             return _fallback_universe()
 
+        # Market cap / exchange / active-trading are already applied server-side;
+        # keep only the delisted-set exclusion as a post-filter.
         delisted = _fmp_delisted_set(api_key, session)
         seen = set()
         tickers = []
         for row in rows:
             if not isinstance(row, dict):
                 continue
-            if row.get('exchangeShortName') not in _FMP_EXCHANGES:
-                continue
-            if str(row.get('type', '')).lower() != 'stock':
-                continue
             sym = row.get('symbol')
             if not sym or sym in seen:
                 continue
-            # /stock/list usually lacks market cap; filter only when present.
-            mc = row.get('marketCap')
-            if mc is not None:
-                try:
-                    if float(mc) < float(min_market_cap):
-                        continue
-                except (TypeError, ValueError):
-                    pass
             if str(sym).upper() in delisted:
                 continue
             seen.add(sym)
