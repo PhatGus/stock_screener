@@ -18,6 +18,27 @@ _FMP_UNIVERSE_CACHE = "fmp_universe_cache.json"
 _FMP_UNIVERSE_TTL = 24 * 3600  # 24 hours
 
 
+# Symbol suffixes that mark warrants / rights / units (and 'W' generally).
+_NON_COMMON_SUFFIXES = ('WS', 'WT', 'W', 'R', 'U')
+
+
+def _is_common_stock_symbol(sym) -> bool:
+    """Heuristic to keep only U.S. common-stock symbols, excluding preferred /
+    foreign-ordinary share classes, warrants, rights and units.
+
+    Drops: symbols containing '.', symbols longer than 5 characters, and
+    symbols ending in W / R / U / WS / WT.
+    """
+    s = str(sym).upper()
+    if '.' in s:
+        return False
+    if len(s) > 5:
+        return False
+    if s.endswith(_NON_COMMON_SUFFIXES):
+        return False
+    return True
+
+
 def _fmp_delisted_set(api_key: str, session) -> set:
     """Set of delisted ticker symbols from FMP (empty set on failure)."""
     out = set()
@@ -71,6 +92,8 @@ def get_fmp_universe(min_market_cap: float = 1_000_000_000):
                 'marketCapMoreThan': int(min_market_cap),
                 'exchangeShortName': 'NYSE,NASDAQ,AMEX',
                 'isActivelyTrading': 'true',
+                'isEtf': 'false',
+                'isFund': 'false',
                 'limit': 10000,
                 'apikey': api_key,
             },
@@ -82,8 +105,11 @@ def get_fmp_universe(min_market_cap: float = 1_000_000_000):
         if not isinstance(rows, list) or not rows:
             return _fallback_universe()
 
-        # Market cap / exchange / active-trading are already applied server-side;
-        # keep only the delisted-set exclusion as a post-filter.
+        # Market cap / exchange / active-trading / ETF / fund are applied
+        # server-side. Post-filter to keep only U.S. common stock symbols and
+        # drop the FMP-delisted set. The screener still returns foreign ADRs,
+        # preferred shares, warrants/rights/units, so exclude those by symbol
+        # shape (FMP doesn't reliably tag them).
         delisted = _fmp_delisted_set(api_key, session)
         seen = set()
         tickers = []
@@ -92,6 +118,8 @@ def get_fmp_universe(min_market_cap: float = 1_000_000_000):
                 continue
             sym = row.get('symbol')
             if not sym or sym in seen:
+                continue
+            if not _is_common_stock_symbol(sym):
                 continue
             if str(sym).upper() in delisted:
                 continue
@@ -356,9 +384,30 @@ def get_ticker_sectors():
 
     return sector_map
 
+def print_fmp_universe_tier_counts():
+    """Print the FMP universe size at each market-cap tier (needs FMP_API_KEY)."""
+    tiers = [('$500M+', 500_000_000), ('$1B+', 1_000_000_000),
+             ('$5B+', 5_000_000_000), ('$10B+', 10_000_000_000)]
+    print("FMP live universe counts by market-cap tier:")
+    for label, floor in tiers:
+        try:
+            n = len(get_fmp_universe(min_market_cap=floor))
+        except Exception as e:
+            n = f"error: {e}"
+        print(f"  {label:8} {n}")
+
+
 if __name__ == "__main__":
-    # Test the module
-    universe = get_full_universe()
-    print(f"Total tickers in universe: {len(universe)}")
-    print(f"First 10 tickers: {universe[:10]}")
-    print(f"Sector ETFs: {get_sector_etfs()}")
+    import sys
+    if '--tiers' in sys.argv:
+        # Fresh counts each tier: invalidate the 24h cache between calls.
+        for _floor in (500_000_000, 1_000_000_000, 5_000_000_000, 10_000_000_000):
+            if os.path.exists(_FMP_UNIVERSE_CACHE):
+                os.remove(_FMP_UNIVERSE_CACHE)
+        print_fmp_universe_tier_counts()
+    else:
+        # Test the module
+        universe = get_full_universe()
+        print(f"Total tickers in universe: {len(universe)}")
+        print(f"First 10 tickers: {universe[:10]}")
+        print(f"Sector ETFs: {get_sector_etfs()}")
