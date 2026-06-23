@@ -5,10 +5,96 @@ Implements screening logic for high-growth stocks
 
 import pandas as pd
 import numpy as np
+import logging
 from typing import Dict, List, Optional, Tuple
 from data_fetcher import StockDataFetcher
 from ticker_universe import get_full_universe, get_ticker_sectors
 from edgar_fetcher import EDGARDataFetcher, EDGARScreeningEnhancer
+
+# Logger writing dropped-ticker reasons to the shared screener_errors.log.
+_gate_logger = logging.getLogger("screener_gates")
+if not _gate_logger.handlers:
+    _gate_logger.setLevel(logging.INFO)
+    _gh = logging.FileHandler("screener_errors.log")
+    _gh.setFormatter(logging.Formatter("%(message)s"))
+    _gate_logger.addHandler(_gh)
+    _gate_logger.propagate = False
+
+
+def _gate_log(ticker: str, gate: str, message: str) -> None:
+    """Log a hard-gate drop as: TICKER | hard_gate:<gate> | message."""
+    try:
+        _gate_logger.info(f"{ticker} | hard_gate:{gate} | {message}")
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Hard universe exclusion gate thresholds (Fix 1).
+# Adjustable here (or via the app sidebar) without touching gate logic.
+# ---------------------------------------------------------------------------
+HARD_GATE_MIN_REVENUE_TTM = 100_000_000
+HARD_GATE_MAX_FCF_MARGIN_FLOOR = -0.20
+HARD_GATE_MAX_EV_EBITDA = 60
+HARD_GATE_BIOTECH_PROXY_GROSS_MARGIN = 0.85
+HARD_GATE_BIOTECH_PROXY_MAX_REVENUE = 500_000_000
+
+
+def apply_hard_gates(df: pd.DataFrame,
+                     min_revenue_ttm: float = HARD_GATE_MIN_REVENUE_TTM,
+                     fcf_margin_floor: float = HARD_GATE_MAX_FCF_MARGIN_FLOOR,
+                     max_ev_ebitda: float = HARD_GATE_MAX_EV_EBITDA,
+                     biotech_gross_margin: float = HARD_GATE_BIOTECH_PROXY_GROSS_MARGIN,
+                     biotech_max_revenue: float = HARD_GATE_BIOTECH_PROXY_MAX_REVENUE):
+    """Apply hard universe exclusion gates before scoring (Fix 1).
+
+    Drops any ticker failing a gate, logs the reason to screener_errors.log, and
+    returns (kept_df, stats) where stats maps each gate name to the list of
+    dropped tickers (a ticker is attributed to the first gate it fails).
+    """
+    stats: Dict[str, List[str]] = {
+        'min_revenue_ttm': [], 'min_fcf_margin': [],
+        'max_ev_ebitda': [], 'revenue_source_proxy': [],
+    }
+    if df is None or df.empty:
+        return df, stats
+
+    df = df.copy()
+    rev = pd.to_numeric(df.get('revenue_ttm'), errors='coerce')
+    fcfm = (pd.to_numeric(df['fcf_margin'], errors='coerce')
+            if 'fcf_margin' in df.columns else pd.Series(np.nan, index=df.index))
+    eve = (pd.to_numeric(df['ev_ebitda'], errors='coerce')
+           if 'ev_ebitda' in df.columns else pd.Series(np.nan, index=df.index))
+    gm = (pd.to_numeric(df['gross_margin'], errors='coerce')
+          if 'gross_margin' in df.columns else pd.Series(np.nan, index=df.index))
+
+    # Gate masks (True == FAIL -> drop).
+    fail_rev = rev.isna() | (rev <= 0) | (rev < min_revenue_ttm)
+    fail_fcf = fcfm.notna() & (fcfm < fcf_margin_floor)
+    fail_ev = eve.notna() & (eve > max_ev_ebitda)
+    fail_bio = gm.notna() & rev.notna() & (gm > biotech_gross_margin) & (rev < biotech_max_revenue)
+
+    keep = pd.Series(True, index=df.index)
+    ordered = [
+        ('min_revenue_ttm', fail_rev,
+         lambda i: f"revenue_ttm={rev.get(i)} (< {min_revenue_ttm:,.0f} or NaN/zero)"),
+        ('min_fcf_margin', fail_fcf,
+         lambda i: f"fcf_margin={fcfm.get(i):.3f} (< {fcf_margin_floor})"),
+        ('max_ev_ebitda', fail_ev,
+         lambda i: f"ev_ebitda={eve.get(i):.2f} (> {max_ev_ebitda})"),
+        ('revenue_source_proxy', fail_bio,
+         lambda i: f"gross_margin={gm.get(i):.3f} & revenue_ttm={rev.get(i):,.0f} "
+                   f"(GM>{biotech_gross_margin} & rev<{biotech_max_revenue:,.0f})"),
+    ]
+    for gate, fail_mask, reason_fn in ordered:
+        hit = fail_mask & keep
+        for i in df.index[hit]:
+            ticker = df.at[i, 'ticker'] if 'ticker' in df.columns else str(i)
+            stats[gate].append(ticker)
+            _gate_log(ticker, gate, reason_fn(i))
+        keep = keep & ~fail_mask
+
+    return df[keep].copy(), stats
 
 # ===========================================================================
 # Horizon-based percentile-rank scoring engine
@@ -50,7 +136,7 @@ FACTOR_FAMILY = {
     'shareholder_yield': 'Capital return',
     'net_buyback_yield': 'Capital return',
     'institutional_ownership_change': 'Positioning',
-    'insider_net_3m': 'Positioning',
+    'insider_net_value_normalized': 'Positioning',
     'short_interest_pct_float': 'Positioning',
     'debt_trend': 'Risk',
 }
@@ -65,7 +151,7 @@ HORIZON_WEIGHTS = {
         'net_margin_trend': 4, 'fcf_margin': 6, 'fcf_yield': 4, 'ev_ebitda': 3,
         'forward_pe': 3, 'capital_efficiency': 5, 'asset_growth': 4,
         'shareholder_yield': 4, 'net_buyback_yield': 3,
-        'institutional_ownership_change': 4, 'insider_net_3m': 3,
+        'institutional_ownership_change': 4, 'insider_net_value_normalized': 3,
         'short_interest_pct_float': 2, 'debt_trend': 2,
     },
     '24m': {
@@ -74,7 +160,7 @@ HORIZON_WEIGHTS = {
         'net_margin_trend': 5, 'fcf_margin': 8, 'fcf_yield': 7, 'ev_ebitda': 6,
         'forward_pe': 5, 'capital_efficiency': 6, 'asset_growth': 7,
         'shareholder_yield': 6, 'net_buyback_yield': 4,
-        'institutional_ownership_change': 3, 'insider_net_3m': 3,
+        'institutional_ownership_change': 3, 'insider_net_value_normalized': 3,
         'short_interest_pct_float': 2, 'debt_trend': 3,
     },
     '36m': {
@@ -83,7 +169,7 @@ HORIZON_WEIGHTS = {
         'net_margin_trend': 6, 'fcf_margin': 9, 'fcf_yield': 9, 'ev_ebitda': 8,
         'forward_pe': 7, 'capital_efficiency': 7, 'asset_growth': 9,
         'shareholder_yield': 8, 'net_buyback_yield': 5,
-        'institutional_ownership_change': 2, 'insider_net_3m': 2,
+        'institutional_ownership_change': 2, 'insider_net_value_normalized': 2,
         'short_interest_pct_float': 2, 'debt_trend': 4,
     },
 }
@@ -169,13 +255,31 @@ def calculate_horizon_scores(df: pd.DataFrame) -> pd.DataFrame:
         return df
     df = df.copy()
 
+    def _col(name: str) -> pd.Series:
+        """Numeric column as a Series, or an all-NaN Series if absent."""
+        if name in df.columns:
+            return pd.to_numeric(df[name], errors='coerce')
+        return pd.Series(np.nan, index=df.index)
+
     # Principle (6): capital-efficiency interaction = pct rank of
     # revenue_growth_yoy / (1 + asset_growth). Missing asset_growth -> treated as
     # 0 so the term degrades to growth alone rather than dropping out.
-    rg = pd.to_numeric(df.get('revenue_growth_yoy', np.nan), errors='coerce')
-    ag = pd.to_numeric(df.get('asset_growth', np.nan), errors='coerce').fillna(0.0)
+    rg = _col('revenue_growth_yoy')
+    ag = _col('asset_growth').fillna(0.0)
     ce_raw = rg / (1.0 + ag)
     df['capital_efficiency'] = ce_raw.rank(pct=True) * 100
+
+    # Fix 6: dollar-weighted insider signal, normalized by market cap so that
+    # large-cap insider buying isn't structurally disadvantaged vs small-cap.
+    inv = _col('insider_net_value_3m')
+    mcap = _col('market_cap')
+    df['insider_net_value_normalized'] = inv / mcap.replace(0.0, np.nan)
+
+    # Fix 2: forward-vs-trailing growth divergence (percentage points).
+    fwd_rev = _col('forward_revenue_estimate')
+    rev_ttm = _col('revenue_ttm')
+    df['forward_revenue_growth'] = (fwd_rev / rev_ttm.replace(0.0, np.nan) - 1.0) * 100
+    df['growth_deceleration'] = df['forward_revenue_growth'] - rg
 
     # Preserve the prior single composite as composite_score_v2 (principle 4).
     df['composite_score_v2'] = pd.to_numeric(df.get('composite_score', np.nan), errors='coerce')
@@ -201,6 +305,22 @@ def calculate_horizon_scores(df: pd.DataFrame) -> pd.DataFrame:
             den[m] = den[m] + w
         df[f'composite_score_{hz}'] = (num / den.replace(0.0, np.nan)).round(2)
 
+    # Fix 2: growth-deceleration penalty / acceleration bonus applied to the
+    # horizon scores after ranking. Tiers are mutually exclusive (the steeper
+    # -30 penalty supersedes the -15 one); scores are clipped back to [0, 100].
+    decel = df['growth_deceleration']
+    penalty = pd.Series(0.0, index=df.index)
+    penalty[decel < -15] = -10.0
+    penalty[decel < -30] = -20.0
+    bonus_12m = pd.Series(0.0, index=df.index)
+    bonus_12m[decel > 10] = 5.0
+    for hz in HORIZONS:
+        col = f'composite_score_{hz}'
+        adj = df[col] + penalty
+        if hz == '12m':
+            adj = adj + bonus_12m
+        df[col] = adj.clip(lower=0.0, upper=100.0).round(2)
+
     # Backward-compatible alias (existing code references composite_score).
     df['composite_score'] = df['composite_score_12m']
     return df
@@ -209,19 +329,32 @@ def calculate_horizon_scores(df: pd.DataFrame) -> pd.DataFrame:
 class GrowthStockScreener:
     """Screen stocks based on growth metrics and other criteria"""
 
-    def __init__(self, fetcher: Optional[StockDataFetcher] = None, use_edgar: bool = False):
+    def __init__(self, fetcher: Optional[StockDataFetcher] = None, use_edgar: bool = False,
+                 gate_min_revenue_ttm: float = HARD_GATE_MIN_REVENUE_TTM,
+                 gate_fcf_margin_floor: float = HARD_GATE_MAX_FCF_MARGIN_FLOOR,
+                 gate_max_ev_ebitda: float = HARD_GATE_MAX_EV_EBITDA,
+                 gate_biotech_gross_margin: float = HARD_GATE_BIOTECH_PROXY_GROSS_MARGIN,
+                 gate_biotech_max_revenue: float = HARD_GATE_BIOTECH_PROXY_MAX_REVENUE):
         """
         Initialize the screener
 
         Args:
             fetcher: Optional StockDataFetcher instance
             use_edgar: Whether to include EDGAR data in screening
+            gate_*: Hard universe exclusion gate thresholds (Fix 1)
         """
         self.fetcher = fetcher or StockDataFetcher()
         self.sector_map = get_ticker_sectors()
         self.use_edgar = use_edgar
         if use_edgar:
             self.edgar_enhancer = EDGARScreeningEnhancer()
+        # Hard-gate thresholds (adjustable per-run, e.g. from the app sidebar).
+        self.gate_min_revenue_ttm = gate_min_revenue_ttm
+        self.gate_fcf_margin_floor = gate_fcf_margin_floor
+        self.gate_max_ev_ebitda = gate_max_ev_ebitda
+        self.gate_biotech_gross_margin = gate_biotech_gross_margin
+        self.gate_biotech_max_revenue = gate_biotech_max_revenue
+        self.gate_stats: Dict[str, List[str]] = {}
 
     def screen_stocks(
         self,
@@ -321,6 +454,22 @@ class GrowthStockScreener:
             df = df[pd.notna(df['analyst_buy_percent'])]
             df = df[df['analyst_buy_percent'] >= min_analyst_buy_percent]
             print(f"  Buy ratings >= {min_analyst_buy_percent}%: {len(df)} stocks")
+
+        # Hard universe exclusion gates (Fix 1) — applied BEFORE any scoring.
+        if len(df) > 0:
+            before = len(df)
+            df, self.gate_stats = apply_hard_gates(
+                df,
+                min_revenue_ttm=self.gate_min_revenue_ttm,
+                fcf_margin_floor=self.gate_fcf_margin_floor,
+                max_ev_ebitda=self.gate_max_ev_ebitda,
+                biotech_gross_margin=self.gate_biotech_gross_margin,
+                biotech_max_revenue=self.gate_biotech_max_revenue,
+            )
+            dropped = before - len(df)
+            if dropped:
+                counts = ", ".join(f"{g}={len(t)}" for g, t in self.gate_stats.items())
+                print(f"  Hard gates removed {dropped} tickers ({counts}); {len(df)} remain")
 
         # Calculate additional metrics
         df = self._calculate_scores(df)

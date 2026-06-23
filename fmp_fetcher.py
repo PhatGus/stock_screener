@@ -49,6 +49,12 @@ V4_BASE = "https://financialmodelingprep.com/api/v4"
 
 REQUEST_TIMEOUT = 10  # seconds, per requirement 8
 
+# Keywords that trip the SEC investigation flag (Fix 4), case-insensitive.
+SEC_FLAG_KEYWORDS = (
+    'investigation', 'securities fraud', 'class action',
+    'sec inquiry', 'subpoena', 'doj',
+)
+
 # ---------------------------------------------------------------------------
 # Logging (shared error log with the rest of the screener)
 # ---------------------------------------------------------------------------
@@ -612,6 +618,9 @@ class FMPStockDataFetcher:
         # ---- Insider transactions (last 90 days) ----
         out.update(self._insider_transactions(ticker))
 
+        # ---- SEC investigation flag (Fix 4) ----
+        out['sec_investigation_flag'] = self._sec_investigation_flag(ticker)
+
         # ---- Technicals (200d MA, relative strength, volume ratio) ----
         out.update(self._technicals(ticker, base, quote))
 
@@ -721,13 +730,19 @@ class FMPStockDataFetcher:
         return out
 
     def _insider_transactions(self, ticker: str) -> Dict:
-        out = {'insider_buy_3m': 0, 'insider_sell_3m': 0, 'insider_net_3m': 0}
+        # Count-based fields (kept for reference) + dollar-weighted fields (Fix 3).
+        out = {
+            'insider_buy_3m': 0, 'insider_sell_3m': 0, 'insider_net_3m': 0,
+            'insider_buy_value_3m': 0.0, 'insider_sell_value_3m': 0.0,
+            'insider_net_value_3m': 0.0,
+        }
         trades = self._get(V4_BASE, "insider-trading", ticker,
                            {'symbol': ticker, 'page': 0})
         if not isinstance(trades, list) or not trades:
             return out
         cutoff = datetime.now() - timedelta(days=90)
         buys = sells = 0
+        buy_val = sell_val = 0.0
         for t in trades:
             try:
                 tdate = datetime.strptime(str(t.get('transactionDate', ''))[:10], "%Y-%m-%d")
@@ -737,15 +752,55 @@ class FMPStockDataFetcher:
                 continue
             ttype = str(t.get('transactionType', '')).upper()
             acq = str(t.get('acquistionOrDisposition', t.get('acquisitionOrDisposition', ''))).upper()
+            # Transaction dollar value: prefer an explicit 'value' field, else
+            # securitiesTransacted * price.
+            val = _num(t.get('value'))
+            if pd.isna(val):
+                shares = _num(t.get('securitiesTransacted'))
+                price = _num(t.get('price'))
+                val = (shares * price) if not pd.isna(shares) and not pd.isna(price) else np.nan
+            val = abs(val) if not pd.isna(val) else 0.0
             # 'P' = purchase, 'S' = sale; 'A' = acquired, 'D' = disposed.
             if ttype.startswith('P') or acq == 'A':
                 buys += 1
+                buy_val += val
             elif ttype.startswith('S') or acq == 'D':
                 sells += 1
+                sell_val += val
         out['insider_buy_3m'] = buys
         out['insider_sell_3m'] = sells
         out['insider_net_3m'] = buys - sells
+        out['insider_buy_value_3m'] = buy_val
+        out['insider_sell_value_3m'] = sell_val
+        out['insider_net_value_3m'] = buy_val - sell_val
         return out
+
+    def _sec_investigation_flag(self, ticker: str) -> bool:
+        """True if any of the 5 most recent 8-K filings within the last 180 days
+        mentions investigation/fraud/subpoena/etc. keywords (Fix 4)."""
+        try:
+            filings = self._get(V3_BASE, f"sec_filings/{ticker}", ticker,
+                                {'type': '8-K', 'limit': 5})
+            if not isinstance(filings, list) or not filings:
+                return False
+            cutoff = datetime.now() - timedelta(days=180)
+            for f in filings:
+                # Date field naming varies (FMP often uses 'fillingDate').
+                raw_date = (f.get('fillingDate') or f.get('fillingdate')
+                            or f.get('acceptedDate') or f.get('date') or '')
+                try:
+                    fdate = datetime.strptime(str(raw_date)[:10], "%Y-%m-%d")
+                    if fdate < cutoff:
+                        continue
+                except (ValueError, TypeError):
+                    pass  # if undated, still scan its text
+                text = " ".join(str(f.get(k, '')) for k in
+                                ('description', 'title', 'type', 'form')).lower()
+                if any(kw in text for kw in SEC_FLAG_KEYWORDS):
+                    return True
+        except Exception as e:
+            _log(ticker, 'sec_filings', str(e))
+        return False
 
     def _technicals(self, ticker: str, base: Dict, quote: Dict) -> Dict:
         out = {

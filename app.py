@@ -95,6 +95,23 @@ def format_pct_decimal(num: float) -> str:
     return f"{num * 100:.1f}%"
 
 
+def format_signed_dollar(num: float) -> str:
+    """Format a signed dollar value, e.g. +$2.4M / -$8.1M."""
+    if pd.isna(num):
+        return "N/A"
+    sign = '+' if num >= 0 else '-'
+    a = abs(num)
+    if a >= 1e9:
+        body = f"${a / 1e9:.1f}B"
+    elif a >= 1e6:
+        body = f"${a / 1e6:.1f}M"
+    elif a >= 1e3:
+        body = f"${a / 1e3:.1f}K"
+    else:
+        body = f"${a:.0f}"
+    return sign + body
+
+
 def color_revenue_growth(val):
     """Color code revenue growth values"""
     if pd.isna(val):
@@ -250,6 +267,34 @@ def main():
             help="Analyze SEC filings (10-K, 10-Q) for deeper insights. Note: This significantly increases processing time."
         )
 
+    # Hard universe gates (Fix 1) — tunable thresholds applied before scoring.
+    st.sidebar.subheader("🚧 Hard Universe Gates")
+    with st.sidebar.expander("Exclusion thresholds"):
+        gate_min_revenue_ttm = st.number_input(
+            "Min revenue TTM ($)", min_value=0.0, value=100_000_000.0, step=10_000_000.0,
+            help="Drop tickers with revenue_ttm NaN/zero or below this",
+        )
+        gate_fcf_margin_floor = st.number_input(
+            "FCF margin floor", min_value=-1.0, max_value=0.0, value=-0.20, step=0.05,
+            help="Drop tickers with fcf_margin below this (e.g. -0.20 = -20%)",
+        )
+        gate_max_ev_ebitda = st.number_input(
+            "Max EV/EBITDA", min_value=0.0, value=60.0, step=5.0,
+            help="Drop tickers with EV/EBITDA above this (NaN kept)",
+        )
+        gate_biotech_gross_margin = st.number_input(
+            "Biotech proxy: gross margin >", min_value=0.0, max_value=1.0, value=0.85, step=0.01,
+            help="Part of the grant/collaboration-revenue proxy gate",
+        )
+        gate_biotech_max_revenue = st.number_input(
+            "Biotech proxy: revenue <", min_value=0.0, value=500_000_000.0, step=50_000_000.0,
+            help="Drop if gross margin > threshold AND revenue below this",
+        )
+        exclude_flagged = st.checkbox(
+            "Exclude SEC-flagged stocks", value=False,
+            help="Hide tickers with sec_investigation_flag = True",
+        )
+
     # Run screening button
     if st.sidebar.button("🚀 Run Screener", type="primary", use_container_width=True):
         run_screening(
@@ -265,7 +310,13 @@ def main():
             show_scores=show_scores,
             export_csv=export_csv,
             refresh_cache=refresh_cache,
-            use_edgar=use_edgar
+            use_edgar=use_edgar,
+            gate_min_revenue_ttm=gate_min_revenue_ttm,
+            gate_fcf_margin_floor=gate_fcf_margin_floor,
+            gate_max_ev_ebitda=gate_max_ev_ebitda,
+            gate_biotech_gross_margin=gate_biotech_gross_margin,
+            gate_biotech_max_revenue=gate_biotech_max_revenue,
+            exclude_flagged=exclude_flagged,
         )
 
     # Horizon to sort the results table by (12m / 24m / 36m).
@@ -332,7 +383,13 @@ def run_screening(
     show_scores: bool,
     export_csv: bool,
     refresh_cache: bool,
-    use_edgar: bool = False
+    use_edgar: bool = False,
+    gate_min_revenue_ttm: float = 100_000_000.0,
+    gate_fcf_margin_floor: float = -0.20,
+    gate_max_ev_ebitda: float = 60.0,
+    gate_biotech_gross_margin: float = 0.85,
+    gate_biotech_max_revenue: float = 500_000_000.0,
+    exclude_flagged: bool = False,
 ):
     """Run the stock screening process"""
 
@@ -369,7 +426,14 @@ def run_screening(
     # interest, insider activity, rule of 40, etc.) so they are available as
     # display columns.
     fetcher.enable_extended = True
-    screener = GrowthStockScreener(fetcher, use_edgar=use_edgar)
+    screener = GrowthStockScreener(
+        fetcher, use_edgar=use_edgar,
+        gate_min_revenue_ttm=gate_min_revenue_ttm,
+        gate_fcf_margin_floor=gate_fcf_margin_floor,
+        gate_max_ev_ebitda=gate_max_ev_ebitda,
+        gate_biotech_gross_margin=gate_biotech_gross_margin,
+        gate_biotech_max_revenue=gate_biotech_max_revenue,
+    )
 
     # Run screening
     try:
@@ -422,6 +486,10 @@ def run_screening(
                     results_df = apply_macro_tags(results_df)
                 except Exception as tag_err:
                     print(f"Macro tagging failed: {tag_err}")
+
+            # Optional filter: hide SEC-flagged stocks (Fix 4 — filter, not gate).
+            if exclude_flagged and 'sec_investigation_flag' in results_df.columns:
+                results_df = results_df[results_df['sec_investigation_flag'] != True]  # noqa: E712
 
             # Store results in session state
             st.session_state.results_df = results_df
@@ -503,9 +571,12 @@ def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool,
     # New FMP-derived columns to surface in the table (inserted just before the
     # composite score). Only those actually present in the dataframe are added.
     new_fmp_columns = [
-        'gross_margin', 'fcf_margin', 'fcf_yield', 'earnings_beat_rate',
-        'eps_revision_net', 'short_interest_pct_float', 'insider_net_3m',
-        'rule_of_40', 'rate_sensitive', 'ai_infrastructure',
+        # Growth group
+        'gross_margin', 'fcf_margin', 'fcf_yield', 'growth_deceleration',
+        'earnings_beat_rate', 'eps_revision_net', 'rule_of_40',
+        # Risk / flow group
+        'short_interest_pct_float', 'insider_net_3m', 'insider_net_value_3m',
+        'sec_investigation_flag', 'rate_sensitive', 'ai_infrastructure',
     ]
     present_new = [c for c in new_fmp_columns if c in df.columns]
     # Insert just before the first horizon-score column.
@@ -527,6 +598,15 @@ def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool,
         if pct_col in display_df.columns:
             display_df[pct_col] = display_df[pct_col].apply(format_pct_decimal)
 
+    # growth_deceleration kept numeric (Styler formats it as +/-pp with color).
+    if 'growth_deceleration' in display_df.columns:
+        display_df['growth_deceleration'] = pd.to_numeric(
+            display_df['growth_deceleration'], errors='coerce').round(1)
+
+    # Dollar-weighted insider flow -> signed dollar string (+$2.4M / -$8.1M).
+    if 'insider_net_value_3m' in display_df.columns:
+        display_df['insider_net_value_3m'] = display_df['insider_net_value_3m'].apply(format_signed_dollar)
+
     # Numeric columns rounded for tidy display.
     for num_col, ndigits in [
         ('earnings_beat_rate', 1), ('eps_revision_net', 0),
@@ -537,7 +617,7 @@ def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool,
             display_df[num_col] = pd.to_numeric(display_df[num_col], errors='coerce').round(ndigits)
 
     # Booleans displayed as-is (True/False).
-    for bool_col in ['rate_sensitive', 'ai_infrastructure']:
+    for bool_col in ['rate_sensitive', 'ai_infrastructure', 'sec_investigation_flag']:
         if bool_col in display_df.columns:
             display_df[bool_col] = display_df[bool_col].astype('boolean')
 
@@ -581,10 +661,13 @@ def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool,
         'gross_margin': 'Gross Margin',
         'fcf_margin': 'FCF Margin',
         'fcf_yield': 'FCF Yield',
+        'growth_deceleration': 'Growth Decel',
         'earnings_beat_rate': 'Beat Rate %',
         'eps_revision_net': 'EPS Rev Net',
         'short_interest_pct_float': 'Short % Float',
         'insider_net_3m': 'Insider Net 3m',
+        'insider_net_value_3m': 'Insider $ Net 3m',
+        'sec_investigation_flag': 'SEC Flag',
         'rule_of_40': 'Rule of 40',
         'rate_sensitive': 'Rate Sensitive',
         'ai_infrastructure': 'AI Infra',
@@ -599,17 +682,32 @@ def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool,
 
     display_df = display_df.rename(columns=column_rename)
 
-    # Color gradient (red = low, green = high) on the three horizon scores.
+    # Color gradient (red = low, green = high) on the three horizon scores, plus
+    # green/red text on the growth-deceleration column.
     score_labels = [s for s in ['Score 12m', 'Score 24m', 'Score 36m']
                     if s in display_df.columns]
     table = display_df
-    if score_labels:
-        try:
-            table = display_df.style.background_gradient(
-                cmap='RdYlGn', subset=score_labels, vmin=0, vmax=100
-            ).format({lbl: '{:.1f}' for lbl in score_labels})
-        except Exception:
-            table = display_df  # fall back to unstyled if Styler unavailable
+
+    def _decel_color(v):
+        if pd.isna(v):
+            return ''
+        return 'color: green' if v > 0 else ('color: red' if v < 0 else '')
+
+    try:
+        sty = display_df.style
+        fmt = {}
+        if score_labels:
+            sty = sty.background_gradient(cmap='RdYlGn', subset=score_labels,
+                                          vmin=0, vmax=100)
+            fmt.update({lbl: '{:.1f}' for lbl in score_labels})
+        if 'Growth Decel' in display_df.columns:
+            sty = sty.map(_decel_color, subset=['Growth Decel'])
+            fmt['Growth Decel'] = lambda v: f"{v:+.1f}pp" if pd.notna(v) else "N/A"
+        if fmt:
+            sty = sty.format(fmt)
+        table = sty
+    except Exception:
+        table = display_df  # fall back to unstyled if Styler unavailable
 
     column_config = {
         "Rev Growth YoY %": st.column_config.NumberColumn(
