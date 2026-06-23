@@ -12,6 +12,7 @@ from typing import List, Dict, Optional
 
 from data_fetcher import StockDataFetcher
 from screener import GrowthStockScreener
+from screener_extension import apply_macro_tags
 from ticker_universe import get_full_universe, get_sp500_tickers, get_nasdaq100_additional, get_high_growth_watchlist
 
 # Page configuration
@@ -87,6 +88,13 @@ def format_eta(seconds: Optional[float]) -> str:
     return f"{hours}h {minutes:02d}m"
 
 
+def format_pct_decimal(num: float) -> str:
+    """Format a decimal ratio (e.g. 0.25) as a percentage string (e.g. 25.0%)."""
+    if pd.isna(num):
+        return "N/A"
+    return f"{num * 100:.1f}%"
+
+
 def color_revenue_growth(val):
     """Color code revenue growth values"""
     if pd.isna(val):
@@ -137,9 +145,9 @@ def main():
         "Min Revenue Growth YoY (%)",
         min_value=0.0,
         max_value=100.0,
-        value=20.0,
+        value=0.0,
         step=5.0,
-        help="Minimum year-over-year revenue growth percentage"
+        help="Optional: minimum year-over-year revenue growth. 0 = show all."
     )
 
     require_positive_forward = st.sidebar.checkbox(
@@ -162,8 +170,8 @@ def main():
     selected_market_cap = st.sidebar.selectbox(
         "Minimum Market Cap",
         list(market_cap_options.keys()),
-        index=3,  # Default to Mid Cap
-        help="Filter by minimum market capitalization"
+        index=0,  # Default to All Caps (no cutoff)
+        help="Optional: filter by minimum market capitalization"
     )
     min_market_cap = market_cap_options[selected_market_cap]
 
@@ -172,9 +180,9 @@ def main():
     max_pe_ratio = st.sidebar.number_input(
         "Max P/E Ratio",
         min_value=0.0,
-        value=100.0,
+        value=0.0,
         step=10.0,
-        help="Maximum price-to-earnings ratio (0 for no limit)"
+        help="Optional: maximum price-to-earnings ratio (0 = no limit)"
     )
 
     require_positive_earnings = st.sidebar.checkbox(
@@ -194,16 +202,16 @@ def main():
     exclude_sectors = st.sidebar.multiselect(
         "Exclude sectors",
         sectors,
-        default=["Utilities", "Real Estate"],
-        help="Sectors to exclude from screening"
+        default=[],
+        help="Optional: sectors to exclude from screening (none by default)"
     )
 
     # Analyst coverage
     st.sidebar.subheader("Analyst Coverage")
     require_analyst_coverage = st.sidebar.checkbox(
         "Require analyst coverage",
-        value=True,
-        help="Only show stocks with analyst coverage"
+        value=False,
+        help="Optional: only show stocks with analyst coverage"
     )
 
     min_analyst_buy_percent = st.sidebar.slider(
@@ -347,6 +355,10 @@ def run_screening(
         cache_max_age_hours=24.0,
         force_refresh=refresh_cache,
     )
+    # Fetch the extended FMP fields (gross margin, FCF, beat rate, short
+    # interest, insider activity, rule of 40, etc.) so they are available as
+    # display columns.
+    fetcher.enable_extended = True
     screener = GrowthStockScreener(fetcher, use_edgar=use_edgar)
 
     # Run screening
@@ -392,6 +404,14 @@ def run_screening(
                         (results_df['implied_earnings_growth'] > 0)
                     ]
                 # If neither column exists, skip filtering
+
+            # Add rule-based macro tags (rate_sensitive, ai_infrastructure, etc.)
+            # as a post-processing step so they appear as display columns.
+            if len(results_df) > 0:
+                try:
+                    results_df = apply_macro_tags(results_df)
+                except Exception as tag_err:
+                    print(f"Macro tagging failed: {tag_err}")
 
             # Store results in session state
             st.session_state.results_df = results_df
@@ -460,11 +480,44 @@ def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool):
             display_columns.extend(['mda_sentiment', 'edgar_score'])
         display_columns.append('composite_score')
 
+    # New FMP-derived columns to surface in the table (inserted just before the
+    # composite score). Only those actually present in the dataframe are added.
+    new_fmp_columns = [
+        'gross_margin', 'fcf_margin', 'fcf_yield', 'earnings_beat_rate',
+        'eps_revision_net', 'short_interest_pct_float', 'insider_net_3m',
+        'rule_of_40', 'rate_sensitive', 'ai_infrastructure',
+    ]
+    present_new = [c for c in new_fmp_columns if c in df.columns]
+    if 'composite_score' in display_columns:
+        idx = display_columns.index('composite_score')
+        display_columns[idx:idx] = present_new
+    else:
+        display_columns.extend(present_new)
+
     # Filter columns that exist
     display_columns = [col for col in display_columns if col in df.columns]
 
     # Format the dataframe for display
     display_df = df[display_columns].copy()
+
+    # Percentage-formatted columns (stored as decimals -> shown as %).
+    for pct_col in ['gross_margin', 'fcf_margin', 'fcf_yield']:
+        if pct_col in display_df.columns:
+            display_df[pct_col] = display_df[pct_col].apply(format_pct_decimal)
+
+    # Numeric columns rounded for tidy display.
+    for num_col, ndigits in [
+        ('earnings_beat_rate', 1), ('eps_revision_net', 0),
+        ('short_interest_pct_float', 4), ('insider_net_3m', 0),
+        ('rule_of_40', 1),
+    ]:
+        if num_col in display_df.columns:
+            display_df[num_col] = pd.to_numeric(display_df[num_col], errors='coerce').round(ndigits)
+
+    # Booleans displayed as-is (True/False).
+    for bool_col in ['rate_sensitive', 'ai_infrastructure']:
+        if bool_col in display_df.columns:
+            display_df[bool_col] = display_df[bool_col].astype('boolean')
 
     # Format columns
     if 'market_cap' in display_df.columns:
@@ -495,6 +548,16 @@ def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool):
         'valuation_score': 'Value Score',
         'analyst_score': 'Analyst Score',
         'momentum_score': 'Momentum Score',
+        'gross_margin': 'Gross Margin',
+        'fcf_margin': 'FCF Margin',
+        'fcf_yield': 'FCF Yield',
+        'earnings_beat_rate': 'Beat Rate %',
+        'eps_revision_net': 'EPS Rev Net',
+        'short_interest_pct_float': 'Short % Float',
+        'insider_net_3m': 'Insider Net 3m',
+        'rule_of_40': 'Rule of 40',
+        'rate_sensitive': 'Rate Sensitive',
+        'ai_infrastructure': 'AI Infra',
         'edgar_score': 'EDGAR Score',
         'mda_sentiment': 'MD&A Sentiment',
         'growth_mentions': 'Growth Mentions',

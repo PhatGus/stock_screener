@@ -91,10 +91,13 @@ class GrowthStockScreener:
             df = df[df['market_cap'] >= min_market_cap]
             print(f"  Market cap >= ${min_market_cap:,.0f}: {len(df)}/{initial_count} stocks")
 
-        # Filter by revenue growth
-        df = df[pd.notna(df['revenue_growth_yoy'])]
-        df = df[df['revenue_growth_yoy'] >= min_revenue_growth]
-        print(f"  Revenue growth >= {min_revenue_growth}%: {len(df)} stocks")
+        # Filter by revenue growth (optional). Only applied when a positive
+        # threshold is set, so by default every fetched/scored stock is kept
+        # (including those with NaN or negative revenue growth).
+        if min_revenue_growth and min_revenue_growth > 0:
+            df = df[pd.notna(df['revenue_growth_yoy'])]
+            df = df[df['revenue_growth_yoy'] >= min_revenue_growth]
+            print(f"  Revenue growth >= {min_revenue_growth}%: {len(df)} stocks")
 
         # Filter by P/E ratio
         if max_pe_ratio > 0:
