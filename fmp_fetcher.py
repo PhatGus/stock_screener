@@ -201,6 +201,28 @@ class FMPStockDataFetcher:
         self._delisted_set = symbols
         return symbols
 
+    def preload_voo_returns(self):
+        """Preload VOO 3m/6m/12m benchmark returns (for relative strength) from
+        FMP and store on self.voo_returns. Logs a startup confirmation."""
+        try:
+            hist = self._get(V3_BASE, "historical-price-full/VOO", "VOO",
+                             {'timeseries': 400})
+            closes = self._closes_from_history(hist)
+            if closes is not None and len(closes) >= 2:
+                r = {
+                    'voo_return_3m': self._period_return(closes, 3),
+                    'voo_return_6m': self._period_return(closes, 6),
+                    'voo_return_12m': self._period_return(closes, 12),
+                }
+                self.voo_returns = r
+                print('VOO returns loaded: 3m={:.1f}% 6m={:.1f}% 12m={:.1f}%'.format(
+                    r['voo_return_3m'], r['voo_return_6m'], r['voo_return_12m']))
+                return r
+        except Exception as e:
+            _log('VOO', 'preload', str(e))
+        print('VOO returns load FAILED — relative_strength_vs_voo_* will be NaN')
+        return None
+
     # ------------------------------------------------------------------
     # Cache variant + progress helpers (mirrors data_fetcher)
     # ------------------------------------------------------------------
@@ -330,6 +352,29 @@ class FMPStockDataFetcher:
         country = profile.get('country') or 'Unknown'
         china_adr = (str(country).strip() in CHINA_COUNTRIES) or (ticker in CHINA_ADR_TICKERS)
 
+        # Fix 1: analyst coverage discount for forward-looking estimate quality.
+        nanl = _num(quote.get('numberOfAnalystOpinions'))
+        num_analysts = int(nanl) if not pd.isna(nanl) else 0
+        if num_analysts >= 15:
+            acw = 1.0
+        elif num_analysts >= 10:
+            acw = 0.85
+        elif num_analysts >= 5:
+            acw = 0.65
+        elif num_analysts >= 2:
+            acw = 0.40
+        else:
+            acw = 0.20
+
+        # Fix 2: gross_margin and fcf_margin as BASE fields from /key-metrics-ttm
+        # (direct TTM margins; avoids the income/cash-flow statement parse that
+        # was returning NaN for most tickers). _extended_fields refines these but
+        # falls back to these base values when its computation is NaN.
+        gross_margin = _num(km.get('grossProfitMarginTTM'))
+        if pd.isna(gross_margin):
+            gross_margin = _num(ratios.get('grossProfitMarginTTM'))
+        fcf_margin = _num(km.get('freeCashFlowMarginTTM'))
+
         return {
             'company_name': profile.get('companyName') or quote.get('name') or ticker,
             'sector': profile.get('sector') or 'Unknown',
@@ -337,6 +382,10 @@ class FMPStockDataFetcher:
             'country': country,
             'is_actively_trading': is_actively_trading,
             'china_adr': china_adr,
+            'num_analysts': num_analysts,
+            'analyst_coverage_weight': acw,
+            'gross_margin': gross_margin,
+            'fcf_margin': fcf_margin,
             'market_cap': _num(quote.get('marketCap') if quote.get('marketCap') is not None
                                else profile.get('mktCap')),
             'current_price': _num(quote.get('price') if quote.get('price') is not None
@@ -548,7 +597,10 @@ class FMPStockDataFetcher:
 
         gm0 = _safe_div(inc0.get('grossProfit'), inc0.get('revenue'))
         gm1 = _safe_div(inc1.get('grossProfit'), inc1.get('revenue'))
-        out['gross_margin'] = gm0
+        # Fix 2: prefer the base /key-metrics-ttm gross margin; only use the
+        # income-statement value when the base is missing.
+        base_gm = _num(base.get('gross_margin'))
+        out['gross_margin'] = base_gm if not pd.isna(base_gm) else gm0
         out['gross_margin_prior_yr'] = gm1
         out['gross_margin_expansion'] = (gm0 - gm1) if not pd.isna(gm0) and not pd.isna(gm1) else np.nan
         out['ebitda_ttm'] = _num(inc0.get('ebitda'))
@@ -568,7 +620,11 @@ class FMPStockDataFetcher:
             fcf = ocf - abs(capex)
         out['operating_cashflow'] = ocf
         out['fcf_ttm'] = fcf
-        out['fcf_margin'] = _safe_div(fcf, revenue_ttm)
+        # Fix 2: fall back to the base /key-metrics-ttm FCF margin when the
+        # cash-flow-statement-derived value is NaN.
+        cf_fcf_margin = _safe_div(fcf, revenue_ttm)
+        base_fcfm = _num(base.get('fcf_margin'))
+        out['fcf_margin'] = cf_fcf_margin if not pd.isna(cf_fcf_margin) else base_fcfm
         out['fcf_yield'] = _safe_div(fcf, market_cap)
         out['capex_intensity'] = _safe_div(abs(capex) if not pd.isna(capex) else np.nan, revenue_ttm)
 
@@ -633,20 +689,28 @@ class FMPStockDataFetcher:
 
         # ---- EPS estimates / revisions (quarterly) ----
         qest = self._get(V3_BASE, f"analyst-estimates/{ticker}",
-                         ticker, {'period': 'quarter', 'limit': 2})
+                         ticker, {'period': 'quarter', 'limit': 3})
+        cur_eps = prior_eps = np.nan
         if isinstance(qest, list) and qest:
-            out['eps_estimate_current_qtr'] = _num(qest[0].get('estimatedEpsAvg'))
+            cur_eps = _num(qest[0].get('estimatedEpsAvg'))
+            out['eps_estimate_current_qtr'] = cur_eps
             if len(qest) >= 2:
-                out['eps_estimate_next_qtr'] = _num(qest[1].get('estimatedEpsAvg'))
+                prior_eps = _num(qest[1].get('estimatedEpsAvg'))
+                out['eps_estimate_next_qtr'] = prior_eps
             else:
                 out['eps_estimate_next_qtr'] = np.nan
         else:
             out['eps_estimate_current_qtr'] = np.nan
             out['eps_estimate_next_qtr'] = np.nan
-        # FMP does not expose 30-day revision counts; leave as NaN.
+        # Fix 2: FMP doesn't expose 30-day revision counts. Use an imperfect
+        # proxy: % change between the current and the prior (2nd row) quarterly
+        # EPS estimate. Better than leaving the factor NaN for every ticker.
         out['eps_revision_up_30d'] = np.nan
         out['eps_revision_down_30d'] = np.nan
-        out['eps_revision_net'] = np.nan
+        if not pd.isna(cur_eps) and not pd.isna(prior_eps) and prior_eps != 0:
+            out['eps_revision_net'] = (cur_eps - prior_eps) / abs(prior_eps) * 100
+        else:
+            out['eps_revision_net'] = np.nan
 
         # ---- Earnings surprises ----
         out.update(self._earnings_surprises(ticker))

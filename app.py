@@ -691,7 +691,8 @@ GROWTH_TIER_COLUMN_ORDER = [
     # Quality
     'gross_margin', 'gross_margin_expansion', 'earnings_quality_ratio',
     # Sentiment
-    'eps_revision_net', 'revenue_estimate_revision', 'analyst_buy_percent', 'forward_estimate_missing',
+    'eps_revision_net', 'revenue_estimate_revision', 'analyst_buy_percent',
+    'num_analysts', 'analyst_coverage_weight', 'forward_estimate_missing',
     # Profitability
     'fcf_margin', 'rule_of_40',
     # Valuation (moved later for growth tiers)
@@ -700,7 +701,8 @@ GROWTH_TIER_COLUMN_ORDER = [
     'short_interest_pct_float', 'debt_trend', 'institutional_ownership_change', 'insider_net_value_3m',
     # Flags
     'rate_sensitive', 'ai_infrastructure', 'china_adr', 'sec_investigation_flag',
-    # Scores
+    # Data quality + scores
+    'data_quality_score',
     'composite_score_12m', 'composite_score_24m', 'composite_score_36m',
 ]
 
@@ -782,7 +784,9 @@ def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool,
         'gross_margin', 'fcf_margin', 'fcf_yield', 'growth_deceleration',
         'earnings_beat_rate', 'eps_revision_net', 'rule_of_40',
         # Sentiment group
-        'forward_estimate_missing',
+        'num_analysts', 'analyst_coverage_weight', 'forward_estimate_missing',
+        # Data quality
+        'data_quality_score',
         # Risk / flow group
         'short_interest_pct_float', 'insider_net_3m', 'insider_net_value_3m',
         'sec_investigation_flag', 'rate_sensitive', 'ai_infrastructure',
@@ -855,6 +859,20 @@ def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool,
         if num_col in display_df.columns:
             display_df[num_col] = pd.to_numeric(display_df[num_col], errors='coerce').round(2)
 
+    # Fix 1: coverage weight (0-1, 2dp) and analyst count (int).
+    if 'analyst_coverage_weight' in display_df.columns:
+        display_df['analyst_coverage_weight'] = pd.to_numeric(
+            display_df['analyst_coverage_weight'], errors='coerce').round(2)
+    if 'num_analysts' in display_df.columns:
+        display_df['num_analysts'] = pd.to_numeric(
+            display_df['num_analysts'], errors='coerce').round(0).astype('Int64')
+
+    # Fix 4: data quality 0-100 with a ⚠ warning when < 50 (less than half the
+    # scored factors populated -> interpret the composite cautiously).
+    if 'data_quality_score' in display_df.columns:
+        display_df['data_quality_score'] = display_df['data_quality_score'].apply(
+            lambda v: (f"⚠ {int(v)}" if v < 50 else f"{int(v)}") if pd.notna(v) else "N/A")
+
     # Format columns
     if 'market_cap' in display_df.columns:
         display_df['market_cap'] = display_df['market_cap'].apply(format_large_number)
@@ -913,6 +931,9 @@ def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool,
         'growth_deceleration': 'Growth Decel',
         'earnings_beat_rate': 'Beat Rate %',
         'eps_revision_net': 'EPS Rev Net',
+        'num_analysts': '# Analysts',
+        'analyst_coverage_weight': 'Coverage Wt',
+        'data_quality_score': 'Data Qual',
         'short_interest_pct_float': 'Short % Float',
         'insider_net_3m': 'Insider Net 3m',
         'insider_net_value_3m': 'Insider $ Net 3m',

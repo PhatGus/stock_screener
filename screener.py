@@ -168,6 +168,7 @@ FACTOR_FAMILY = {
     'capital_efficiency': 'Growth',
     'revenue_growth_yoy': 'Growth',
     'forward_revenue_growth': 'Growth',
+    'forward_revenue_growth_weighted': 'Growth',
     'asset_growth': 'Capital discipline',
     'shareholder_yield': 'Capital return',
     'net_buyback_yield': 'Capital return',
@@ -177,67 +178,85 @@ FACTOR_FAMILY = {
     'debt_trend': 'Risk',
 }
 
-# Three-tier base factor weights. Core de-emphasizes raw growth and rewards
-# FCF/value/quality; Growth and Speculative flip this (momentum + growth
-# dominate, value signals minimized). Keys are dataframe column names
-# ('forward_pe' == fwd_pe). Weights are normalized to sum to 100 before use.
-TIER_WEIGHTS = {
+TIERS = ('core', 'growth', 'speculative')
+HORIZONS = ('12m', '24m', '36m')
+
+# Fix 3: fully separate per-horizon weight VECTORS (not a mild tilt) so 12m and
+# 36m scores diverge meaningfully. The Growth tier's explicit horizon weights:
+HORIZON_WEIGHTS_GROWTH = {
+    '12m': {
+        'forward_revenue_growth_weighted': 18, 'momentum_12_1': 16, 'eps_revision_net': 10,
+        'revenue_estimate_revision': 6, 'capital_efficiency': 4, 'gross_margin': 5,
+        'gross_margin_expansion': 4, 'earnings_quality_ratio': 3, 'net_margin_trend': 3,
+        'fcf_margin': 3, 'fcf_yield': 1, 'ev_ebitda': 1, 'forward_pe': 1,
+        'asset_growth': 3, 'shareholder_yield': 1, 'net_buyback_yield': 1,
+        'institutional_ownership_change': 5, 'insider_net_value_normalized': 4,
+        'short_interest_pct_float': 4, 'debt_trend': 3, 'revenue_growth_yoy': 4,
+    },
+    '24m': {
+        'forward_revenue_growth_weighted': 10, 'momentum_12_1': 8, 'eps_revision_net': 7,
+        'revenue_estimate_revision': 5, 'capital_efficiency': 6, 'gross_margin': 8,
+        'gross_margin_expansion': 6, 'earnings_quality_ratio': 5, 'net_margin_trend': 5,
+        'fcf_margin': 6, 'fcf_yield': 4, 'ev_ebitda': 4, 'forward_pe': 3,
+        'asset_growth': 6, 'shareholder_yield': 3, 'net_buyback_yield': 2,
+        'institutional_ownership_change': 4, 'insider_net_value_normalized': 4,
+        'short_interest_pct_float': 3, 'debt_trend': 4, 'revenue_growth_yoy': 5,
+    },
+    '36m': {
+        'forward_revenue_growth_weighted': 4, 'momentum_12_1': 3, 'eps_revision_net': 4,
+        'revenue_estimate_revision': 3, 'capital_efficiency': 7, 'gross_margin': 10,
+        'gross_margin_expansion': 8, 'earnings_quality_ratio': 7, 'net_margin_trend': 6,
+        'fcf_margin': 9, 'fcf_yield': 8, 'ev_ebitda': 7, 'forward_pe': 6,
+        'asset_growth': 8, 'shareholder_yield': 6, 'net_buyback_yield': 4,
+        'institutional_ownership_change': 3, 'insider_net_value_normalized': 4,
+        'short_interest_pct_float': 2, 'debt_trend': 5, 'revenue_growth_yoy': 5,
+    },
+}
+
+# Growth tier base = per-factor mean across horizons; the horizon SHAPE is each
+# factor's per-horizon multiple of that mean. Applying that shape to any tier's
+# base weights gives the same aggressive 12m->36m shift, scaled proportionally
+# to that tier's emphasis (Core / Speculative).
+_GROWTH_BASE = {f: sum(HORIZON_WEIGHTS_GROWTH[h][f] for h in HORIZONS) / 3.0
+                for f in HORIZON_WEIGHTS_GROWTH['12m']}
+_HORIZON_SHAPE = {f: {h: HORIZON_WEIGHTS_GROWTH[h][f] / _GROWTH_BASE[f] for h in HORIZONS}
+                  for f in _GROWTH_BASE}
+
+# Per-tier base emphasis (single weight per factor); Core rewards value/quality,
+# Speculative rewards momentum/growth. forward_revenue_growth_weighted replaces
+# raw forward growth (Fix 1); relative strength is no longer a scored factor.
+TIER_BASE = {
+    'growth': _GROWTH_BASE,
     'core': {
         'capital_efficiency': 6, 'gross_margin': 8, 'gross_margin_expansion': 5,
         'earnings_quality_ratio': 5, 'net_margin_trend': 4, 'fcf_margin': 7,
         'fcf_yield': 4, 'ev_ebitda': 4, 'forward_pe': 4, 'momentum_12_1': 8,
-        'relative_strength_vs_voo_12m': 5, 'eps_revision_net': 6,
-        'revenue_estimate_revision': 4, 'asset_growth': 5, 'shareholder_yield': 4,
-        'net_buyback_yield': 3, 'institutional_ownership_change': 3,
-        'insider_net_value_normalized': 3, 'short_interest_pct_float': 2,
-        'debt_trend': 2, 'revenue_growth_yoy': 6, 'forward_revenue_growth': 6,
-    },
-    'growth': {
-        'capital_efficiency': 5, 'gross_margin': 7, 'gross_margin_expansion': 6,
-        'earnings_quality_ratio': 4, 'net_margin_trend': 5, 'fcf_margin': 5,
-        'fcf_yield': 2, 'ev_ebitda': 2, 'forward_pe': 2, 'momentum_12_1': 12,
-        'relative_strength_vs_voo_12m': 6, 'eps_revision_net': 8,
-        'revenue_estimate_revision': 5, 'asset_growth': 4, 'shareholder_yield': 2,
-        'net_buyback_yield': 2, 'institutional_ownership_change': 4,
-        'insider_net_value_normalized': 4, 'short_interest_pct_float': 3,
-        'debt_trend': 3, 'revenue_growth_yoy': 10, 'forward_revenue_growth': 12,
+        'eps_revision_net': 6, 'revenue_estimate_revision': 4, 'asset_growth': 5,
+        'shareholder_yield': 4, 'net_buyback_yield': 3, 'institutional_ownership_change': 3,
+        'insider_net_value_normalized': 3, 'short_interest_pct_float': 2, 'debt_trend': 2,
+        'revenue_growth_yoy': 6, 'forward_revenue_growth_weighted': 6,
     },
     'speculative': {
         'capital_efficiency': 4, 'gross_margin': 5, 'gross_margin_expansion': 6,
         'earnings_quality_ratio': 3, 'net_margin_trend': 5, 'fcf_margin': 3,
         'fcf_yield': 1, 'ev_ebitda': 1, 'forward_pe': 1, 'momentum_12_1': 14,
-        'relative_strength_vs_voo_12m': 7, 'eps_revision_net': 8,
-        'revenue_estimate_revision': 5, 'asset_growth': 3, 'shareholder_yield': 1,
-        'net_buyback_yield': 1, 'institutional_ownership_change': 5,
-        'insider_net_value_normalized': 5, 'short_interest_pct_float': 4,
-        'debt_trend': 4, 'revenue_growth_yoy': 14, 'forward_revenue_growth': 16,
+        'eps_revision_net': 8, 'revenue_estimate_revision': 5, 'asset_growth': 3,
+        'shareholder_yield': 1, 'net_buyback_yield': 1, 'institutional_ownership_change': 5,
+        'insider_net_value_normalized': 5, 'short_interest_pct_float': 4, 'debt_trend': 4,
+        'revenue_growth_yoy': 14, 'forward_revenue_growth_weighted': 16,
     },
 }
 
-TIERS = ('core', 'growth', 'speculative')
-HORIZONS = ('12m', '24m', '36m')
-
-# Per-horizon family emphasis tilt applied ON TOP of the tier base weights so the
-# 12m/24m/36m scores keep the short-term-momentum vs long-term-quality character:
-# 12m leans momentum/growth, 36m leans quality/value. (24m is neutral.)
-HORIZON_FAMILY_TILT = {
-    '12m': {'Momentum': 1.6, 'Earnings momentum': 1.4, 'Growth': 1.3, 'Value': 0.7,
-            'Quality': 0.7, 'Profitability': 0.8, 'Capital discipline': 1.0,
-            'Capital return': 0.8, 'Positioning': 1.1, 'Risk': 1.0},
-    '24m': {'Momentum': 1.0, 'Earnings momentum': 1.0, 'Growth': 1.0, 'Value': 1.0,
-            'Quality': 1.0, 'Profitability': 1.0, 'Capital discipline': 1.0,
-            'Capital return': 1.0, 'Positioning': 1.0, 'Risk': 1.0},
-    '36m': {'Momentum': 0.5, 'Earnings momentum': 0.6, 'Growth': 0.7, 'Value': 1.4,
-            'Quality': 1.4, 'Profitability': 1.3, 'Capital discipline': 1.1,
-            'Capital return': 1.3, 'Positioning': 0.9, 'Risk': 1.1},
-}
+# Back-compat alias: code/validation that referenced TIER_WEIGHTS for the scored
+# factor set still works (same 21 factors).
+TIER_WEIGHTS = TIER_BASE
 
 
 def normalized_weights(tier: str, horizon: str) -> Dict[str, float]:
-    """Tier base weights tilted by horizon, scaled to sum to 100."""
-    base = TIER_WEIGHTS[tier]
-    tilt = HORIZON_FAMILY_TILT[horizon]
-    raw = {f: base[f] * tilt.get(FACTOR_FAMILY[f], 1.0) for f in base}
+    """Per-(tier, horizon) weights: tier base emphasis shaped by the aggressive
+    horizon profile, scaled to sum to 100."""
+    base = TIER_BASE[tier]
+    raw = {f: base[f] * _HORIZON_SHAPE[f][horizon] for f in base}
     total = float(sum(raw.values()))
     return {f: v / total * 100.0 for f, v in raw.items()}
 
@@ -350,8 +369,24 @@ def calculate_horizon_scores(df: pd.DataFrame, tier: str = 'growth') -> pd.DataF
     df['forward_estimate_missing'] = df['forward_revenue_growth'].isna()
     df.loc[df['forward_estimate_missing'], 'growth_deceleration'] = -20.0
 
+    # Fix 1: discount forward revenue growth by analyst coverage before ranking
+    # (thin coverage -> less reliable forward estimate). Raw forward growth is
+    # kept for display; the weighted version is what the composite scores.
+    acw = _col('analyst_coverage_weight').fillna(1.0)
+    df['forward_revenue_growth_weighted'] = df['forward_revenue_growth'] * acw
+
     # Preserve the prior single composite as composite_score_v2 (principle 4).
     df['composite_score_v2'] = pd.to_numeric(df.get('composite_score', np.nan), errors='coerce')
+
+    # Fix 4: data_quality_score = % of scored factors with non-NaN raw values
+    # (computed BEFORE any median fallback, on the factor columns themselves).
+    scored_factors = sorted(set().union(*[w.keys() for w in TIER_BASE.values()]))
+    cov_cols = [f for f in scored_factors if f in df.columns]
+    if cov_cols:
+        df['data_quality_score'] = (df[cov_cols].notna().sum(axis=1)
+                                    / len(scored_factors) * 100).round(0)
+    else:
+        df['data_quality_score'] = 0.0
 
     # Pre-compute every factor rank once (with sign + sector normalization).
     factors = sorted(set().union(*[w.keys() for w in TIER_WEIGHTS.values()]))
@@ -472,6 +507,15 @@ class GrowthStockScreener:
         # Get tickers to screen
         if tickers is None:
             tickers = get_full_universe()
+
+        # Preload the VOO benchmark returns ONCE before the ticker loop so
+        # relative_strength_vs_voo_* can be computed (prints a startup confirm).
+        preload = getattr(self.fetcher, 'preload_voo_returns', None)
+        if callable(preload) and getattr(self.fetcher, 'voo_returns', None) is None:
+            try:
+                preload()
+            except Exception as e:
+                print(f"VOO preload skipped: {e}")
 
         # Fix 1: drop FMP-delisted tickers BEFORE fetching (saves API calls on
         # dead tickers). Only runs when the fetcher exposes a delisted set.
