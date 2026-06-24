@@ -41,6 +41,18 @@ HARD_GATE_BIOTECH_PROXY_MAX_REVENUE = 500_000_000
 HARD_GATE_ACTIVE_LISTING = True          # exclude inactive/delisted tickers
 HARD_GATE_MIN_FORWARD_REVENUE_GROWTH = 0.10  # 10% minimum forward revenue growth
 
+# Tier-specific hard-gate thresholds (three-tier architecture). Speculative gets
+# looser gates because early-stage compounders often run negative FCF / high
+# valuations, and the biotech-proxy gate is skipped for it.
+TIER_GATES = {
+    'core': {'min_revenue_ttm': 500_000_000, 'fcf_margin_floor': -0.20,
+             'max_ev_ebitda': 60, 'min_forward_revenue_growth': 0.10, 'apply_biotech': True},
+    'growth': {'min_revenue_ttm': 50_000_000, 'fcf_margin_floor': -0.40,
+               'max_ev_ebitda': 80, 'min_forward_revenue_growth': 0.20, 'apply_biotech': True},
+    'speculative': {'min_revenue_ttm': 10_000_000, 'fcf_margin_floor': -0.60,
+                    'max_ev_ebitda': 120, 'min_forward_revenue_growth': 0.30, 'apply_biotech': False},
+}
+
 
 def apply_hard_gates(df: pd.DataFrame,
                      min_revenue_ttm: float = HARD_GATE_MIN_REVENUE_TTM,
@@ -49,7 +61,8 @@ def apply_hard_gates(df: pd.DataFrame,
                      biotech_gross_margin: float = HARD_GATE_BIOTECH_PROXY_GROSS_MARGIN,
                      biotech_max_revenue: float = HARD_GATE_BIOTECH_PROXY_MAX_REVENUE,
                      active_listing: bool = HARD_GATE_ACTIVE_LISTING,
-                     min_forward_revenue_growth: float = HARD_GATE_MIN_FORWARD_REVENUE_GROWTH):
+                     min_forward_revenue_growth: float = HARD_GATE_MIN_FORWARD_REVENUE_GROWTH,
+                     apply_biotech: bool = True):
     """Apply hard universe exclusion gates before scoring (Fix 1).
 
     Drops any ticker failing a gate, logs the reason to screener_errors.log, and
@@ -84,7 +97,8 @@ def apply_hard_gates(df: pd.DataFrame,
     fail_rev = rev.isna() | (rev <= 0) | (rev < min_revenue_ttm)
     fail_fcf = fcfm.notna() & (fcfm < fcf_margin_floor)
     fail_ev = eve.notna() & (eve > max_ev_ebitda)
-    fail_bio = gm.notna() & rev.notna() & (gm > biotech_gross_margin) & (rev < biotech_max_revenue)
+    fail_bio = (apply_biotech & gm.notna() & rev.notna()
+                & (gm > biotech_gross_margin) & (rev < biotech_max_revenue))
     # NaN forward growth is NOT excluded here (handled by the conservative
     # deceleration penalty in calculate_horizon_scores instead).
     fail_fwd = fwd_growth.notna() & (fwd_growth < min_fwd_pct)
@@ -140,6 +154,7 @@ SECTOR_RANKED = {'gross_margin', 'fcf_margin'}
 # Factor -> family (used for the validation weight-by-family printout).
 FACTOR_FAMILY = {
     'momentum_12_1': 'Momentum',
+    'relative_strength_vs_voo_12m': 'Momentum',
     'eps_revision_net': 'Earnings momentum',
     'revenue_estimate_revision': 'Earnings momentum',
     'gross_margin': 'Quality',
@@ -151,6 +166,8 @@ FACTOR_FAMILY = {
     'ev_ebitda': 'Value',
     'forward_pe': 'Value',
     'capital_efficiency': 'Growth',
+    'revenue_growth_yoy': 'Growth',
+    'forward_revenue_growth': 'Growth',
     'asset_growth': 'Capital discipline',
     'shareholder_yield': 'Capital return',
     'net_buyback_yield': 'Capital return',
@@ -160,53 +177,75 @@ FACTOR_FAMILY = {
     'debt_trend': 'Risk',
 }
 
-# Principle (4)+(6): per-horizon raw weights. capital_efficiency replaces raw
-# revenue_growth_yoy in the score (5/6/7). Weights are normalized to sum to 100
-# before use. Keys are the actual dataframe column names ('forward_pe' == fwd_pe).
-HORIZON_WEIGHTS = {
-    '12m': {
-        'momentum_12_1': 14, 'eps_revision_net': 10, 'revenue_estimate_revision': 6,
-        'gross_margin': 6, 'gross_margin_expansion': 6, 'earnings_quality_ratio': 5,
-        'net_margin_trend': 4, 'fcf_margin': 6, 'fcf_yield': 4, 'ev_ebitda': 3,
-        'forward_pe': 3, 'capital_efficiency': 5, 'asset_growth': 4,
-        'shareholder_yield': 4, 'net_buyback_yield': 3,
-        'institutional_ownership_change': 4, 'insider_net_value_normalized': 3,
-        'short_interest_pct_float': 2, 'debt_trend': 2,
+# Three-tier base factor weights. Core de-emphasizes raw growth and rewards
+# FCF/value/quality; Growth and Speculative flip this (momentum + growth
+# dominate, value signals minimized). Keys are dataframe column names
+# ('forward_pe' == fwd_pe). Weights are normalized to sum to 100 before use.
+TIER_WEIGHTS = {
+    'core': {
+        'capital_efficiency': 6, 'gross_margin': 8, 'gross_margin_expansion': 5,
+        'earnings_quality_ratio': 5, 'net_margin_trend': 4, 'fcf_margin': 7,
+        'fcf_yield': 4, 'ev_ebitda': 4, 'forward_pe': 4, 'momentum_12_1': 8,
+        'relative_strength_vs_voo_12m': 5, 'eps_revision_net': 6,
+        'revenue_estimate_revision': 4, 'asset_growth': 5, 'shareholder_yield': 4,
+        'net_buyback_yield': 3, 'institutional_ownership_change': 3,
+        'insider_net_value_normalized': 3, 'short_interest_pct_float': 2,
+        'debt_trend': 2, 'revenue_growth_yoy': 6, 'forward_revenue_growth': 6,
     },
-    '24m': {
-        'momentum_12_1': 7, 'eps_revision_net': 6, 'revenue_estimate_revision': 4,
-        'gross_margin': 7, 'gross_margin_expansion': 7, 'earnings_quality_ratio': 7,
-        'net_margin_trend': 5, 'fcf_margin': 8, 'fcf_yield': 7, 'ev_ebitda': 6,
-        'forward_pe': 5, 'capital_efficiency': 6, 'asset_growth': 7,
-        'shareholder_yield': 6, 'net_buyback_yield': 4,
-        'institutional_ownership_change': 3, 'insider_net_value_normalized': 3,
-        'short_interest_pct_float': 2, 'debt_trend': 3,
+    'growth': {
+        'capital_efficiency': 5, 'gross_margin': 7, 'gross_margin_expansion': 6,
+        'earnings_quality_ratio': 4, 'net_margin_trend': 5, 'fcf_margin': 5,
+        'fcf_yield': 2, 'ev_ebitda': 2, 'forward_pe': 2, 'momentum_12_1': 12,
+        'relative_strength_vs_voo_12m': 6, 'eps_revision_net': 8,
+        'revenue_estimate_revision': 5, 'asset_growth': 4, 'shareholder_yield': 2,
+        'net_buyback_yield': 2, 'institutional_ownership_change': 4,
+        'insider_net_value_normalized': 4, 'short_interest_pct_float': 3,
+        'debt_trend': 3, 'revenue_growth_yoy': 10, 'forward_revenue_growth': 12,
     },
-    '36m': {
-        'momentum_12_1': 3, 'eps_revision_net': 3, 'revenue_estimate_revision': 2,
-        'gross_margin': 8, 'gross_margin_expansion': 8, 'earnings_quality_ratio': 8,
-        'net_margin_trend': 6, 'fcf_margin': 9, 'fcf_yield': 9, 'ev_ebitda': 8,
-        'forward_pe': 7, 'capital_efficiency': 7, 'asset_growth': 9,
-        'shareholder_yield': 8, 'net_buyback_yield': 5,
-        'institutional_ownership_change': 2, 'insider_net_value_normalized': 2,
-        'short_interest_pct_float': 2, 'debt_trend': 4,
+    'speculative': {
+        'capital_efficiency': 4, 'gross_margin': 5, 'gross_margin_expansion': 6,
+        'earnings_quality_ratio': 3, 'net_margin_trend': 5, 'fcf_margin': 3,
+        'fcf_yield': 1, 'ev_ebitda': 1, 'forward_pe': 1, 'momentum_12_1': 14,
+        'relative_strength_vs_voo_12m': 7, 'eps_revision_net': 8,
+        'revenue_estimate_revision': 5, 'asset_growth': 3, 'shareholder_yield': 1,
+        'net_buyback_yield': 1, 'institutional_ownership_change': 5,
+        'insider_net_value_normalized': 5, 'short_interest_pct_float': 4,
+        'debt_trend': 4, 'revenue_growth_yoy': 14, 'forward_revenue_growth': 16,
     },
 }
 
+TIERS = ('core', 'growth', 'speculative')
 HORIZONS = ('12m', '24m', '36m')
 
+# Per-horizon family emphasis tilt applied ON TOP of the tier base weights so the
+# 12m/24m/36m scores keep the short-term-momentum vs long-term-quality character:
+# 12m leans momentum/growth, 36m leans quality/value. (24m is neutral.)
+HORIZON_FAMILY_TILT = {
+    '12m': {'Momentum': 1.6, 'Earnings momentum': 1.4, 'Growth': 1.3, 'Value': 0.7,
+            'Quality': 0.7, 'Profitability': 0.8, 'Capital discipline': 1.0,
+            'Capital return': 0.8, 'Positioning': 1.1, 'Risk': 1.0},
+    '24m': {'Momentum': 1.0, 'Earnings momentum': 1.0, 'Growth': 1.0, 'Value': 1.0,
+            'Quality': 1.0, 'Profitability': 1.0, 'Capital discipline': 1.0,
+            'Capital return': 1.0, 'Positioning': 1.0, 'Risk': 1.0},
+    '36m': {'Momentum': 0.5, 'Earnings momentum': 0.6, 'Growth': 0.7, 'Value': 1.4,
+            'Quality': 1.4, 'Profitability': 1.3, 'Capital discipline': 1.1,
+            'Capital return': 1.3, 'Positioning': 0.9, 'Risk': 1.1},
+}
 
-def normalized_weights(horizon: str) -> Dict[str, float]:
-    """Weights for a horizon, scaled to sum to 100 (principle 4)."""
-    w = HORIZON_WEIGHTS[horizon]
-    total = float(sum(w.values()))
-    return {f: v / total * 100.0 for f, v in w.items()}
+
+def normalized_weights(tier: str, horizon: str) -> Dict[str, float]:
+    """Tier base weights tilted by horizon, scaled to sum to 100."""
+    base = TIER_WEIGHTS[tier]
+    tilt = HORIZON_FAMILY_TILT[horizon]
+    raw = {f: base[f] * tilt.get(FACTOR_FAMILY[f], 1.0) for f in base}
+    total = float(sum(raw.values()))
+    return {f: v / total * 100.0 for f, v in raw.items()}
 
 
-def family_weights(horizon: str) -> Dict[str, float]:
-    """Effective normalized weight carried by each factor family in a horizon."""
+def family_weights(tier: str, horizon: str) -> Dict[str, float]:
+    """Effective normalized weight carried by each factor family (tier, horizon)."""
     fam: Dict[str, float] = {}
-    for f, w in normalized_weights(horizon).items():
+    for f, w in normalized_weights(tier, horizon).items():
         fam[FACTOR_FAMILY[f]] = fam.get(FACTOR_FAMILY[f], 0.0) + w
     return fam
 
@@ -264,15 +303,19 @@ def _assert_factor_sign(df: pd.DataFrame, factor: str, rank: pd.Series) -> None:
         assert corr > 0, f"Sign error: '{factor}' is high-is-good but corr(raw, rank)={corr:.3f} <= 0"
 
 
-def calculate_horizon_scores(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute composite_score_12m/24m/36m from weighted percentile ranks.
+def calculate_horizon_scores(df: pd.DataFrame, tier: str = 'growth') -> pd.DataFrame:
+    """Compute composite_score_12m/24m/36m from weighted percentile ranks using
+    the given tier's factor weights ('core' / 'growth' / 'speculative').
 
-    Stores the previous composite as composite_score_v2 and aliases
-    composite_score to the 12m score for backward compatibility.
+    Stores the previous composite as composite_score_v2, records the tier in a
+    'tier' column, and aliases composite_score to the 12m score.
     """
     if df is None or df.empty:
         return df
+    if tier not in TIER_WEIGHTS:
+        tier = 'growth'
     df = df.copy()
+    df['tier'] = tier
 
     def _col(name: str) -> pd.Series:
         """Numeric column as a Series, or an all-NaN Series if absent."""
@@ -311,7 +354,7 @@ def calculate_horizon_scores(df: pd.DataFrame) -> pd.DataFrame:
     df['composite_score_v2'] = pd.to_numeric(df.get('composite_score', np.nan), errors='coerce')
 
     # Pre-compute every factor rank once (with sign + sector normalization).
-    factors = sorted(set().union(*[w.keys() for w in HORIZON_WEIGHTS.values()]))
+    factors = sorted(set().union(*[w.keys() for w in TIER_WEIGHTS.values()]))
     ranks: Dict[str, pd.Series] = {}
     for f in factors:
         r = _factor_rank(df, f)
@@ -321,7 +364,7 @@ def calculate_horizon_scores(df: pd.DataFrame) -> pd.DataFrame:
     # Weighted average of available ranks per horizon (per-ticker renormalization
     # over non-NaN factors keeps scores comparable when some factors are missing).
     for hz in HORIZONS:
-        wn = normalized_weights(hz)
+        wn = normalized_weights(tier, hz)
         num = pd.Series(0.0, index=df.index)
         den = pd.Series(0.0, index=df.index)
         for f, w in wn.items():
@@ -356,34 +399,44 @@ class GrowthStockScreener:
     """Screen stocks based on growth metrics and other criteria"""
 
     def __init__(self, fetcher: Optional[StockDataFetcher] = None, use_edgar: bool = False,
-                 gate_min_revenue_ttm: float = HARD_GATE_MIN_REVENUE_TTM,
-                 gate_fcf_margin_floor: float = HARD_GATE_MAX_FCF_MARGIN_FLOOR,
-                 gate_max_ev_ebitda: float = HARD_GATE_MAX_EV_EBITDA,
+                 tier: str = 'growth',
+                 gate_min_revenue_ttm: Optional[float] = None,
+                 gate_fcf_margin_floor: Optional[float] = None,
+                 gate_max_ev_ebitda: Optional[float] = None,
                  gate_biotech_gross_margin: float = HARD_GATE_BIOTECH_PROXY_GROSS_MARGIN,
                  gate_biotech_max_revenue: float = HARD_GATE_BIOTECH_PROXY_MAX_REVENUE,
                  gate_active_listing: bool = HARD_GATE_ACTIVE_LISTING,
-                 gate_min_forward_revenue_growth: float = HARD_GATE_MIN_FORWARD_REVENUE_GROWTH):
+                 gate_min_forward_revenue_growth: Optional[float] = None):
         """
         Initialize the screener
 
         Args:
             fetcher: Optional StockDataFetcher instance
             use_edgar: Whether to include EDGAR data in screening
-            gate_*: Hard universe exclusion gate thresholds (Fix 1)
+            tier: 'core' | 'growth' | 'speculative' — sets gate + scoring defaults
+            gate_*: Hard-gate overrides; None falls back to the tier default
         """
         self.fetcher = fetcher or StockDataFetcher()
         self.sector_map = get_ticker_sectors()
         self.use_edgar = use_edgar
         if use_edgar:
             self.edgar_enhancer = EDGARScreeningEnhancer()
-        # Hard-gate thresholds (adjustable per-run, e.g. from the app sidebar).
-        self.gate_min_revenue_ttm = gate_min_revenue_ttm
-        self.gate_fcf_margin_floor = gate_fcf_margin_floor
-        self.gate_max_ev_ebitda = gate_max_ev_ebitda
+        # Tier-specific defaults; explicit gate_* args override per-run.
+        self.tier = tier if tier in TIER_GATES else 'growth'
+        tg = TIER_GATES[self.tier]
+        self.gate_min_revenue_ttm = (gate_min_revenue_ttm if gate_min_revenue_ttm is not None
+                                     else tg['min_revenue_ttm'])
+        self.gate_fcf_margin_floor = (gate_fcf_margin_floor if gate_fcf_margin_floor is not None
+                                      else tg['fcf_margin_floor'])
+        self.gate_max_ev_ebitda = (gate_max_ev_ebitda if gate_max_ev_ebitda is not None
+                                   else tg['max_ev_ebitda'])
         self.gate_biotech_gross_margin = gate_biotech_gross_margin
         self.gate_biotech_max_revenue = gate_biotech_max_revenue
         self.gate_active_listing = gate_active_listing
-        self.gate_min_forward_revenue_growth = gate_min_forward_revenue_growth
+        self.gate_min_forward_revenue_growth = (gate_min_forward_revenue_growth
+                                                if gate_min_forward_revenue_growth is not None
+                                                else tg['min_forward_revenue_growth'])
+        self.gate_apply_biotech = tg['apply_biotech']
         self.gate_stats: Dict[str, List[str]] = {}
         self.delisted_excluded: List[str] = []
 
@@ -518,6 +571,7 @@ class GrowthStockScreener:
                 biotech_max_revenue=self.gate_biotech_max_revenue,
                 active_listing=self.gate_active_listing,
                 min_forward_revenue_growth=self.gate_min_forward_revenue_growth,
+                apply_biotech=self.gate_apply_biotech,
             )
             dropped = before - len(df)
             if dropped:
@@ -538,7 +592,7 @@ class GrowthStockScreener:
         # This stores the prior composite as composite_score_v2 and aliases
         # composite_score to the 12m score.
         if len(df) > 0:
-            df = calculate_horizon_scores(df)
+            df = calculate_horizon_scores(df, tier=self.tier)
 
         # Sort by composite score (12m by default)
         df = df.sort_values('composite_score', ascending=False)

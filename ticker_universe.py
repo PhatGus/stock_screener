@@ -149,6 +149,127 @@ def _fallback_universe():
         return get_sp500_tickers()
 
 
+# Three-tier universe ranges (key, label, marketCapMoreThan, marketCapLowerThan).
+# FMP's upper-bound query param is 'marketCapLowerThan'.
+_TIER_RANGES = [
+    ('tier1', 'Core ($10B+)', 10_000_000_000, None),
+    ('tier2', 'Growth ($1B-$10B)', 1_000_000_000, 10_000_000_000),
+    ('tier3', 'Speculative ($250M-$1B)', 250_000_000, 1_000_000_000),
+]
+_TIER_LABELS = {k: lbl for k, lbl, _, _ in _TIER_RANGES}
+
+
+def _fetch_screener_symbols(api_key, session, min_cap, max_cap, delisted):
+    """One /stock-screener fetch + common-stock/delisted post-filter.
+
+    Returns the filtered symbol list, or None on a failed request.
+    """
+    params = {
+        'marketCapMoreThan': int(min_cap),
+        'exchangeShortName': 'NYSE,NASDAQ,AMEX',
+        'isActivelyTrading': 'true',
+        'isEtf': 'false',
+        'isFund': 'false',
+        'limit': 10000,
+        'apikey': api_key,
+    }
+    if max_cap is not None:
+        params['marketCapLowerThan'] = int(max_cap)
+    resp = session.get(f"{_FMP_V3}/stock-screener", params=params, timeout=30)
+    if resp.status_code != 200:
+        return None
+    rows = resp.json()
+    if not isinstance(rows, list):
+        return None
+    seen = set()
+    out = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        sym = row.get('symbol')
+        if not sym or sym in seen:
+            continue
+        if not _is_common_stock_symbol(sym):
+            continue
+        if str(sym).upper() in delisted:
+            continue
+        seen.add(sym)
+        out.append(sym)
+    return out
+
+
+def _print_tier_counts(result):
+    print("Tiered universe loaded:")
+    for key, label, _, _ in _TIER_RANGES:
+        print(f"  {label:24} {len(result.get(key, []))} tickers")
+
+
+def _fallback_tiered():
+    """Degraded static split when the FMP tiered fetch is unavailable."""
+    try:
+        full = get_full_universe()
+    except Exception:
+        full = get_sp500_tickers()
+    res = {
+        'tier1': get_sp500_tickers(),
+        'tier2': full,
+        'tier3': get_high_growth_watchlist(),
+    }
+    _print_tier_counts(res)
+    return res
+
+
+def get_tiered_universe():
+    """Build three separate ticker lists (one per tier) from FMP /stock-screener.
+
+    Returns {'tier1': [...], 'tier2': [...], 'tier3': [...]} with the same
+    common-stock symbol filters as get_fmp_universe(). The three lists are cached
+    together in fmp_universe_cache.json under tier1_tickers/tier2_tickers/
+    tier3_tickers with a 24h TTL. Falls back to a static split on failure.
+    """
+    # Serve from the 24h cache when all three tiers are present and fresh.
+    try:
+        if os.path.exists(_FMP_UNIVERSE_CACHE):
+            with open(_FMP_UNIVERSE_CACHE) as fh:
+                cached = json.load(fh)
+            fresh = (time.time() - cached.get('fetched_at', 0)) < _FMP_UNIVERSE_TTL
+            keys = [f"{k}_tickers" for k, _, _, _ in _TIER_RANGES]
+            if fresh and all(cached.get(k) for k in keys):
+                result = {k: cached[f"{k}_tickers"] for k, _, _, _ in _TIER_RANGES}
+                _print_tier_counts(result)
+                return result
+    except Exception:
+        pass
+
+    api_key = os.environ.get('FMP_API_KEY')
+    if not api_key or requests is None:
+        return _fallback_tiered()
+
+    try:
+        session = requests.Session()
+        delisted = _fmp_delisted_set(api_key, session)
+        result = {}
+        for key, _, mn, mx in _TIER_RANGES:
+            syms = _fetch_screener_symbols(api_key, session, mn, mx, delisted)
+            if syms is None:
+                return _fallback_tiered()
+            result[key] = syms
+
+        payload = {'fetched_at': time.time()}
+        for key, _, _, _ in _TIER_RANGES:
+            payload[f"{key}_tickers"] = result[key]
+        try:
+            with open(_FMP_UNIVERSE_CACHE, 'w') as fh:
+                json.dump(payload, fh)
+        except Exception:
+            pass
+
+        _print_tier_counts(result)
+        return result
+    except Exception:
+        return _fallback_tiered()
+
+
 def get_additional_sp500():
     """Additional S&P 500 companies to complete the index"""
     return [

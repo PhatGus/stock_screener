@@ -27,7 +27,7 @@ import pandas as pd
 
 from screener import (
     HORIZONS,
-    HORIZON_WEIGHTS,
+    TIER_WEIGHTS,
     LOW_IS_GOOD,
     SECTOR_RANKED,
     calculate_horizon_scores,
@@ -36,7 +36,8 @@ from screener import (
 )
 
 CACHE_DB = "ticker_cache.db"
-SCORED_FACTORS = sorted(set().union(*[w.keys() for w in HORIZON_WEIGHTS.values()]))
+SCORED_FACTORS = sorted(set().union(*[w.keys() for w in TIER_WEIGHTS.values()]))
+VALIDATION_TIER = 'growth'
 
 
 def load_cached_batch() -> pd.DataFrame:
@@ -136,11 +137,11 @@ def main():
 
     # --- Check 4: effective weight per family per horizon ---
     print("\n[4] Effective weight per factor family (normalized to 100):")
-    families = sorted({fam for hz in HORIZONS for fam in family_weights(hz)})
+    families = sorted({fam for hz in HORIZONS for fam in family_weights(VALIDATION_TIER, hz)})
     header = "    " + "family".ljust(20) + "".join(h.rjust(9) for h in HORIZONS)
     print(header)
     print("    " + "-" * (20 + 9 * len(HORIZONS)))
-    fam_by_hz = {hz: family_weights(hz) for hz in HORIZONS}
+    fam_by_hz = {hz: family_weights(VALIDATION_TIER, hz) for hz in HORIZONS}
     for fam in families:
         cells = "".join(f"{fam_by_hz[hz].get(fam, 0.0):8.1f}" for hz in HORIZONS)
         print("    " + fam.ljust(20) + cells)

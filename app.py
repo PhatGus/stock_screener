@@ -15,7 +15,8 @@ from screener import GrowthStockScreener
 from screener_extension import apply_macro_tags
 from ticker_universe import (get_full_universe, get_sp500_tickers,
                              get_nasdaq100_additional, get_high_growth_watchlist,
-                             get_fmp_universe)
+                             get_fmp_universe, get_tiered_universe)
+from screener import TIER_GATES
 
 # Page configuration
 st.set_page_config(
@@ -53,6 +54,33 @@ def load_universe_options() -> Dict[str, List[str]]:
         "High Growth Watchlist": get_high_growth_watchlist(),
         "Full Universe (~800 stocks)": get_full_universe(),
     }
+
+
+# Three-tier screening definitions. Order matters for the radio control.
+TIER_META = {
+    'core': {
+        'label': '🏛️ Core ($10B+)', 'universe_key': 'tier1',
+        'cap_range': '$10B+', 'growth_floor': 10,
+        'emphasis': 'FCF, margins & value (quality compounders)',
+    },
+    'growth': {
+        'label': '🚀 Growth ($1B–$10B)', 'universe_key': 'tier2',
+        'cap_range': '$1B–$10B', 'growth_floor': 20,
+        'emphasis': 'momentum & growth (high-growth mid-caps)',
+    },
+    'speculative': {
+        'label': '⚡ Speculative ($250M–$1B)', 'universe_key': 'tier3',
+        'cap_range': '$250M–$1B', 'growth_floor': 30,
+        'emphasis': 'momentum & growth with looser gates (early compounders)',
+    },
+}
+TIER_BY_LABEL = {m['label']: k for k, m in TIER_META.items()}
+
+
+@st.cache_data(ttl=3600)
+def load_tiered_universe() -> Dict[str, List[str]]:
+    """Cached tiered universe ({tier1/2/3: [...]}) from FMP."""
+    return get_tiered_universe()
 
 
 def format_large_number(num: float) -> str:
@@ -139,46 +167,31 @@ def main():
     # Sidebar for screening parameters
     st.sidebar.header("🎯 Screening Criteria")
 
-    # Universe selection (Fix 2: FMP Live dynamic universe vs static file).
-    st.sidebar.subheader("Stock Universe")
-    universe_source = st.sidebar.radio(
-        "Universe source",
-        options=['FMP Live', 'Static File'],
-        index=0,  # default FMP Live
-        horizontal=True,
-        help="FMP Live builds the universe dynamically from FMP; Static File uses the bundled lists",
+    # Primary control: three-tier selector (default Growth).
+    st.sidebar.subheader("🎚️ Screening Tier")
+    tier_label = st.sidebar.radio(
+        "Tier",
+        options=[TIER_META[k]['label'] for k in ('core', 'growth', 'speculative')],
+        index=1,  # default Growth
+        help="Tier sets the market-cap range, forward-growth floor, gate "
+             "thresholds and factor weights",
     )
-    mcap_choices = {'$500M': 500_000_000, '$1B': 1_000_000_000,
-                    '$5B': 5_000_000_000, '$10B': 10_000_000_000}
-    universe_min_mcap_label = st.sidebar.selectbox(
-        "Min market cap (universe)", list(mcap_choices.keys()), index=1,  # default $1B
-        help="Market-cap floor for the FMP Live universe",
-    )
-    universe_min_mcap = mcap_choices[universe_min_mcap_label]
+    tier = TIER_BY_LABEL[tier_label]
+    tier_meta = TIER_META[tier]
 
-    if universe_source == 'FMP Live':
-        try:
-            tickers = get_fmp_universe(min_market_cap=universe_min_mcap)
-        except Exception as e:
-            tickers = []
-            st.sidebar.warning(f"⚠️ FMP universe fetch failed ({e}); using static fallback.")
-            tickers = get_full_universe()
-    else:
-        universe_options = load_universe_options()
-        selected_universe = st.sidebar.selectbox(
-            "Select stock universe",
-            list(universe_options.keys()),
-            index=0,
-            help="Choose the set of stocks to screen"
-        )
-        tickers = universe_options.get(selected_universe)
+    # Load this tier's universe (FMP tiered, cached; static split fallback).
+    try:
+        tiered = load_tiered_universe()
+        tickers = tiered.get(tier_meta['universe_key'], [])
+    except Exception as e:
+        st.sidebar.warning(f"⚠️ Tiered universe fetch failed ({e}); static fallback.")
+        tickers = get_full_universe()
 
-    # Guard against a universe source returning None/empty so we never len(None).
     if not tickers:
         tickers = []
-        st.sidebar.warning("⚠️ No tickers available for the selected universe.")
+        st.sidebar.warning("⚠️ No tickers available for this tier.")
     else:
-        st.sidebar.info(f"📊 Screening {len(tickers)} stocks")
+        st.sidebar.info(f"📊 {tier_meta['cap_range']} • {len(tickers)} stocks")
 
     # Revenue growth criteria
     st.sidebar.subheader("Growth Metrics")
@@ -291,69 +304,90 @@ def main():
             help="Analyze SEC filings (10-K, 10-Q) for deeper insights. Note: This significantly increases processing time."
         )
 
-    # Hard universe gates (Fix 1) — tunable thresholds applied before scoring.
+    # Hard universe gates — defaults are tier-aware (change with the tier) and
+    # still tunable. Widget keys include the tier so switching tier resets the
+    # defaults to that tier's thresholds.
+    tg = TIER_GATES[tier]
     st.sidebar.subheader("🚧 Hard Universe Gates")
-    with st.sidebar.expander("Exclusion thresholds"):
+    with st.sidebar.expander(f"Exclusion thresholds ({tier_meta['cap_range']})"):
         gate_min_revenue_ttm = st.number_input(
-            "Min revenue TTM ($)", min_value=0.0, value=100_000_000.0, step=10_000_000.0,
+            "Min revenue TTM ($)", min_value=0.0, value=float(tg['min_revenue_ttm']),
+            step=10_000_000.0, key=f"gate_rev_{tier}",
             help="Drop tickers with revenue_ttm NaN/zero or below this",
         )
         gate_fcf_margin_floor = st.number_input(
-            "FCF margin floor", min_value=-1.0, max_value=0.0, value=-0.20, step=0.05,
+            "FCF margin floor", min_value=-1.0, max_value=0.0, value=float(tg['fcf_margin_floor']),
+            step=0.05, key=f"gate_fcf_{tier}",
             help="Drop tickers with fcf_margin below this (e.g. -0.20 = -20%)",
         )
         gate_max_ev_ebitda = st.number_input(
-            "Max EV/EBITDA", min_value=0.0, value=60.0, step=5.0,
+            "Max EV/EBITDA", min_value=0.0, value=float(tg['max_ev_ebitda']), step=5.0,
+            key=f"gate_ev_{tier}",
             help="Drop tickers with EV/EBITDA above this (NaN kept)",
         )
         gate_biotech_gross_margin = st.number_input(
             "Biotech proxy: gross margin >", min_value=0.0, max_value=1.0, value=0.85, step=0.01,
-            help="Part of the grant/collaboration-revenue proxy gate",
+            key=f"gate_biogm_{tier}",
+            help="Part of the grant/collaboration-revenue proxy gate "
+                 + ("(skipped for Speculative)" if not tg['apply_biotech'] else ""),
         )
         gate_biotech_max_revenue = st.number_input(
             "Biotech proxy: revenue <", min_value=0.0, value=500_000_000.0, step=50_000_000.0,
+            key=f"gate_biorev_{tier}",
             help="Drop if gross margin > threshold AND revenue below this",
         )
         gate_min_forward_growth_pct = st.slider(
-            "Min forward revenue growth (%)", min_value=0.0, max_value=30.0,
-            value=10.0, step=1.0,
+            "Min forward revenue growth (%)", min_value=0.0, max_value=40.0,
+            value=float(tg['min_forward_revenue_growth'] * 100), step=1.0,
+            key=f"gate_fwd_{tier}",
             help="Drop tickers whose forward revenue growth is below this "
                  "(NaN forward growth is kept and penalized instead)",
         )
         exclude_flagged = st.checkbox(
-            "Exclude SEC-flagged stocks", value=False,
+            "Exclude SEC-flagged stocks", value=False, key=f"excl_sec_{tier}",
             help="Hide tickers with sec_investigation_flag = True",
         )
         exclude_china_adr = st.checkbox(
-            "Exclude China ADRs", value=True,
+            "Exclude China ADRs", value=True, key=f"excl_cn_{tier}",
             help="Hide tickers flagged china_adr = True",
         )
 
-    # Run screening button
-    if st.sidebar.button("🚀 Run Screener", type="primary", use_container_width=True):
+    # Shared kwargs for both run buttons.
+    common_kwargs = dict(
+        min_revenue_growth=min_revenue_growth,
+        min_market_cap=min_market_cap,
+        max_pe_ratio=max_pe_ratio,
+        exclude_sectors=exclude_sectors,
+        require_positive_earnings=require_positive_earnings,
+        require_analyst_coverage=require_analyst_coverage,
+        min_analyst_buy_percent=min_analyst_buy_percent,
+        require_positive_forward=require_positive_forward,
+        show_scores=show_scores,
+        export_csv=export_csv,
+        refresh_cache=refresh_cache,
+        use_edgar=use_edgar,
+        gate_biotech_gross_margin=gate_biotech_gross_margin,
+        gate_biotech_max_revenue=gate_biotech_max_revenue,
+        exclude_flagged=exclude_flagged,
+        exclude_china_adr=exclude_china_adr,
+    )
+
+    # Run screening button (single tier).
+    if st.sidebar.button(f"🚀 Run {tier_meta['label'].split(' ')[1]} Screen",
+                         type="primary", use_container_width=True):
+        st.session_state.pop('all_tiers', None)
         run_screening(
-            tickers=tickers,
-            min_revenue_growth=min_revenue_growth,
-            min_market_cap=min_market_cap,
-            max_pe_ratio=max_pe_ratio,
-            exclude_sectors=exclude_sectors,
-            require_positive_earnings=require_positive_earnings,
-            require_analyst_coverage=require_analyst_coverage,
-            min_analyst_buy_percent=min_analyst_buy_percent,
-            require_positive_forward=require_positive_forward,
-            show_scores=show_scores,
-            export_csv=export_csv,
-            refresh_cache=refresh_cache,
-            use_edgar=use_edgar,
+            tickers=tickers, tier=tier,
             gate_min_revenue_ttm=gate_min_revenue_ttm,
             gate_fcf_margin_floor=gate_fcf_margin_floor,
             gate_max_ev_ebitda=gate_max_ev_ebitda,
-            gate_biotech_gross_margin=gate_biotech_gross_margin,
-            gate_biotech_max_revenue=gate_biotech_max_revenue,
             gate_min_forward_revenue_growth=gate_min_forward_growth_pct / 100.0,
-            exclude_flagged=exclude_flagged,
-            exclude_china_adr=exclude_china_adr,
+            **common_kwargs,
         )
+
+    # Run All Tiers button — screen every tier with its own gates/weights.
+    if st.sidebar.button("🌐 Run All Tiers", use_container_width=True):
+        run_all_tiers(common_kwargs)
 
     # Horizon to sort the results table by (12m / 24m / 36m).
     st.sidebar.subheader("Ranking Horizon")
@@ -365,11 +399,14 @@ def main():
         help="Which horizon score ranks the results table",
     )
 
-    # Main content area - default view
-    if 'results_df' not in st.session_state:
-        show_welcome_screen()
+    # Main content area.
+    if st.session_state.get('all_tiers'):
+        show_all_tiers(st.session_state.all_tiers)
+    elif 'results_df' in st.session_state:
+        show_results(st.session_state.results_df, show_scores, export_csv, sort_horizon,
+                     tier=st.session_state.get('results_tier', 'growth'))
     else:
-        show_results(st.session_state.results_df, show_scores, export_csv, sort_horizon)
+        show_welcome_screen()
 
 
 def show_welcome_screen():
@@ -420,12 +457,13 @@ def run_screening(
     export_csv: bool,
     refresh_cache: bool,
     use_edgar: bool = False,
-    gate_min_revenue_ttm: float = 100_000_000.0,
-    gate_fcf_margin_floor: float = -0.20,
-    gate_max_ev_ebitda: float = 60.0,
+    tier: str = 'growth',
+    gate_min_revenue_ttm: float = None,
+    gate_fcf_margin_floor: float = None,
+    gate_max_ev_ebitda: float = None,
     gate_biotech_gross_margin: float = 0.85,
     gate_biotech_max_revenue: float = 500_000_000.0,
-    gate_min_forward_revenue_growth: float = 0.10,
+    gate_min_forward_revenue_growth: float = None,
     exclude_flagged: bool = False,
     exclude_china_adr: bool = True,
 ):
@@ -465,7 +503,7 @@ def run_screening(
     # display columns.
     fetcher.enable_extended = True
     screener = GrowthStockScreener(
-        fetcher, use_edgar=use_edgar,
+        fetcher, use_edgar=use_edgar, tier=tier,
         gate_min_revenue_ttm=gate_min_revenue_ttm,
         gate_fcf_margin_floor=gate_fcf_margin_floor,
         gate_max_ev_ebitda=gate_max_ev_ebitda,
@@ -474,6 +512,7 @@ def run_screening(
         gate_active_listing=True,
         gate_min_forward_revenue_growth=gate_min_forward_revenue_growth,
     )
+    st.session_state.results_tier = tier
 
     # Run screening
     try:
@@ -551,8 +590,123 @@ def run_screening(
         status_text.empty()
 
 
+def _run_tier_screen(tickers, tier, common_kwargs):
+    """Screen one tier (its own gates + weights) and return the processed df."""
+    fetcher = StockDataFetcher(
+        rate_limit_delay=0.1, min_ticker_delay=1.5, max_ticker_delay=2.0,
+        batch_size=25, batch_delay=10.0, use_cache=True, cache_max_age_hours=24.0,
+        force_refresh=common_kwargs.get('refresh_cache', False),
+    )
+    fetcher.enable_extended = True
+    screener = GrowthStockScreener(
+        fetcher, use_edgar=common_kwargs.get('use_edgar', False), tier=tier,
+        gate_biotech_gross_margin=common_kwargs.get('gate_biotech_gross_margin', 0.85),
+        gate_biotech_max_revenue=common_kwargs.get('gate_biotech_max_revenue', 500_000_000.0),
+        gate_active_listing=True,
+    )
+    df = screener.screen_stocks(
+        tickers=tickers,
+        min_revenue_growth=common_kwargs.get('min_revenue_growth', 0.0),
+        min_market_cap=common_kwargs.get('min_market_cap', 0.0),
+        max_pe_ratio=common_kwargs.get('max_pe_ratio', 0.0),
+        exclude_sectors=common_kwargs.get('exclude_sectors') or None,
+        require_positive_earnings=common_kwargs.get('require_positive_earnings', False),
+        require_analyst_coverage=common_kwargs.get('require_analyst_coverage', False),
+        min_analyst_buy_percent=common_kwargs.get('min_analyst_buy_percent', 0.0),
+    )
+    if df is None or len(df) == 0:
+        return df
+    try:
+        df = apply_macro_tags(df)
+    except Exception as e:
+        print(f"Macro tagging failed: {e}")
+    if common_kwargs.get('exclude_flagged') and 'sec_investigation_flag' in df.columns:
+        df = df[df['sec_investigation_flag'] != True]  # noqa: E712
+    if common_kwargs.get('exclude_china_adr') and 'china_adr' in df.columns:
+        df = df[df['china_adr'] != True]  # noqa: E712
+    return df
+
+
+def run_all_tiers(common_kwargs):
+    """Screen all three tiers and stash the results for the cross-tier view."""
+    if common_kwargs.get('refresh_cache'):
+        st.cache_data.clear()
+    try:
+        tiered = load_tiered_universe()
+    except Exception as e:
+        st.error(f"Tiered universe fetch failed: {e}")
+        return
+    results = {}
+    prog = st.progress(0)
+    status = st.empty()
+    for i, t in enumerate(('core', 'growth', 'speculative')):
+        meta = TIER_META[t]
+        tks = tiered.get(meta['universe_key'], [])
+        status.text(f"Screening {meta['label']} ({len(tks)} tickers)...")
+        try:
+            results[t] = _run_tier_screen(tks, t, common_kwargs)
+        except Exception as e:
+            st.warning(f"{meta['label']} failed: {e}")
+            results[t] = None
+        prog.progress((i + 1) / 3)
+    prog.empty()
+    status.empty()
+    st.session_state.all_tiers = results
+    st.session_state.pop('results_df', None)
+    st.success("✅ All tiers screened.")
+
+
+def show_all_tiers(results):
+    """Cross-tier view: top 20 by 12m score in each tier, collapsible."""
+    st.header("🌐 All Tiers — Cross-Tier View")
+    st.caption("Top 20 by 12m score in each tier (each scored with its own gates & weights).")
+    for t in ('core', 'growth', 'speculative'):
+        meta = TIER_META[t]
+        df = results.get(t)
+        n = 0 if df is None else len(df)
+        with st.expander(f"{meta['label']} — {n} stocks scored", expanded=(t == 'growth')):
+            if df is None or n == 0:
+                st.write("No stocks passed this tier's gates.")
+                continue
+            top = df.sort_values('composite_score_12m', ascending=False).head(20)
+            cols = [c for c in ['ticker', 'company_name', 'sector', 'market_cap',
+                                'revenue_growth_yoy', 'forward_revenue_growth', 'momentum_12_1',
+                                'composite_score_12m', 'composite_score_24m', 'composite_score_36m']
+                    if c in top.columns]
+            disp = top[cols].copy()
+            if 'market_cap' in disp.columns:
+                disp['market_cap'] = disp['market_cap'].apply(format_large_number)
+            st.dataframe(disp, hide_index=True, use_container_width=True)
+
+
+# Column order for the Growth/Speculative tiers — lead with growth signals,
+# push valuation later (df column names; only those present are shown).
+GROWTH_TIER_COLUMN_ORDER = [
+    # Identity
+    'ticker', 'company_name', 'sector', 'country', 'market_cap', 'tier',
+    # Growth
+    'revenue_growth_yoy', 'forward_revenue_growth', 'growth_deceleration', 'net_margin_trend',
+    # Momentum
+    'momentum_12_1', 'relative_strength_vs_voo_12m',
+    # Quality
+    'gross_margin', 'gross_margin_expansion', 'earnings_quality_ratio',
+    # Sentiment
+    'eps_revision_net', 'revenue_estimate_revision', 'analyst_buy_percent', 'forward_estimate_missing',
+    # Profitability
+    'fcf_margin', 'rule_of_40',
+    # Valuation (moved later for growth tiers)
+    'forward_pe', 'ev_ebitda',
+    # Risk / flow
+    'short_interest_pct_float', 'debt_trend', 'institutional_ownership_change', 'insider_net_value_3m',
+    # Flags
+    'rate_sensitive', 'ai_infrastructure', 'china_adr', 'sec_investigation_flag',
+    # Scores
+    'composite_score_12m', 'composite_score_24m', 'composite_score_36m',
+]
+
+
 def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool,
-                 sort_horizon: str = '12m'):
+                 sort_horizon: str = '12m', tier: str = 'growth'):
     """Display screening results"""
 
     if df.empty:
@@ -566,6 +720,13 @@ def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool,
         df = df.sort_values(sort_col, ascending=False)
     elif 'composite_score' in df.columns:
         df = df.sort_values('composite_score', ascending=False)
+
+    # Tier header + description.
+    meta = TIER_META.get(tier, TIER_META['growth'])
+    tier_word = meta['label'].split(' ')[1]
+    st.header(f"{meta['label'].split(' ')[0]} {tier_word} Screen — {len(df)} stocks scored")
+    st.caption(f"Market cap {meta['cap_range']} • forward-growth floor {meta['growth_floor']}% • "
+               f"scoring emphasis: {meta['emphasis']}.")
 
     # Summary metrics
     col1, col2, col3, col4 = st.columns(4)
@@ -633,6 +794,21 @@ def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool,
     else:
         display_columns.extend(present_new)
 
+    # Add the 'tier' column to the identity group when present.
+    if 'tier' in df.columns and 'tier' not in display_columns:
+        anchor = 'market_cap' if 'market_cap' in display_columns else display_columns[0]
+        display_columns.insert(display_columns.index(anchor) + 1, 'tier')
+
+    # Growth / Speculative tiers: reorder column groups to lead with growth
+    # signals and push valuation later (Core keeps the default valuation-led order).
+    if tier in ('growth', 'speculative'):
+        ordered_nonscore = [c for c in GROWTH_TIER_COLUMN_ORDER
+                            if c in df.columns and c not in score_cols]
+        extras_nonscore = [c for c in display_columns
+                           if c in df.columns and c not in ordered_nonscore and c not in score_cols]
+        display_columns = (ordered_nonscore + extras_nonscore
+                           + [c for c in score_cols if c in df.columns])
+
     # Filter columns that exist
     display_columns = [col for col in display_columns if col in df.columns]
 
@@ -664,9 +840,17 @@ def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool,
 
     # Booleans displayed as-is (True/False).
     for bool_col in ['rate_sensitive', 'ai_infrastructure', 'sec_investigation_flag',
-                     'forward_estimate_missing']:
+                     'forward_estimate_missing', 'china_adr']:
         if bool_col in display_df.columns:
             display_df[bool_col] = display_df[bool_col].astype('boolean')
+
+    # Generic 1-dp rounding for the additional numeric factors surfaced in the
+    # tier-ordered table (raw values; just tidy them for display).
+    for num_col in ['net_margin_trend', 'momentum_12_1', 'relative_strength_vs_voo_12m',
+                    'revenue_estimate_revision', 'debt_trend', 'institutional_ownership_change',
+                    'forward_revenue_growth', 'ev_ebitda']:
+        if num_col in display_df.columns:
+            display_df[num_col] = pd.to_numeric(display_df[num_col], errors='coerce').round(2)
 
     # Format columns
     if 'market_cap' in display_df.columns:
@@ -692,7 +876,17 @@ def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool,
         'company_name': 'Company',
         'sector': 'Sector',
         'country': 'Country',
+        'tier': 'Tier',
         'forward_estimate_missing': 'Fwd Est Missing',
+        'net_margin_trend': 'Net Margin Trend',
+        'momentum_12_1': 'Momentum 12-1',
+        'relative_strength_vs_voo_12m': 'RS vs VOO 12m',
+        'revenue_estimate_revision': 'Rev Est Revision',
+        'forward_revenue_growth': 'Fwd Rev Growth %',
+        'ev_ebitda': 'EV/EBITDA',
+        'debt_trend': 'Debt Trend',
+        'institutional_ownership_change': 'Inst Own Δ',
+        'china_adr': 'China ADR',
         'market_cap': 'Market Cap',
         'current_price': 'Price',
         'revenue_growth_yoy': 'Rev Growth YoY %',
