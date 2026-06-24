@@ -687,7 +687,7 @@ GROWTH_TIER_COLUMN_ORDER = [
     # Growth
     'revenue_growth_yoy', 'forward_revenue_growth', 'growth_deceleration', 'net_margin_trend',
     # Momentum
-    'momentum_12_1', 'relative_strength_vs_voo_12m',
+    'momentum_12_1', 'return_6m', 'return_1yr', 'return_3yr', 'relative_strength_vs_voo_12m',
     # Quality
     'gross_margin', 'gross_margin_expansion', 'earnings_quality_ratio',
     # Sentiment
@@ -776,6 +776,8 @@ def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool,
     # New FMP-derived columns to surface in the table (inserted just before the
     # composite score). Only those actually present in the dataframe are added.
     new_fmp_columns = [
+        # Momentum group (momentum_12_1 + display-only trailing returns)
+        'momentum_12_1', 'return_6m', 'return_1yr', 'return_3yr',
         # Growth group
         'gross_margin', 'fcf_margin', 'fcf_yield', 'growth_deceleration',
         'earnings_beat_rate', 'eps_revision_net', 'rule_of_40',
@@ -848,7 +850,8 @@ def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool,
     # tier-ordered table (raw values; just tidy them for display).
     for num_col in ['net_margin_trend', 'momentum_12_1', 'relative_strength_vs_voo_12m',
                     'revenue_estimate_revision', 'debt_trend', 'institutional_ownership_change',
-                    'forward_revenue_growth', 'ev_ebitda']:
+                    'forward_revenue_growth', 'ev_ebitda',
+                    'return_6m', 'return_1yr', 'return_3yr']:
         if num_col in display_df.columns:
             display_df[num_col] = pd.to_numeric(display_df[num_col], errors='coerce').round(2)
 
@@ -880,6 +883,9 @@ def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool,
         'forward_estimate_missing': 'Fwd Est Missing',
         'net_margin_trend': 'Net Margin Trend',
         'momentum_12_1': 'Momentum 12-1',
+        'return_6m': 'Return 6m',
+        'return_1yr': 'Return 1yr',
+        'return_3yr': 'Return 3yr',
         'relative_strength_vs_voo_12m': 'RS vs VOO 12m',
         'revenue_estimate_revision': 'Rev Est Revision',
         'forward_revenue_growth': 'Fwd Rev Growth %',
@@ -946,6 +952,13 @@ def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool,
         if 'Growth Decel' in display_df.columns:
             sty = sty.map(_decel_color, subset=['Growth Decel'])
             fmt['Growth Decel'] = lambda v: f"{v:+.1f}pp" if pd.notna(v) else "N/A"
+        # Trailing returns: green/positive, red/negative, formatted +/-X.X%.
+        return_labels = [lbl for lbl in ('Return 6m', 'Return 1yr', 'Return 3yr')
+                         if lbl in display_df.columns]
+        if return_labels:
+            sty = sty.map(_decel_color, subset=return_labels)
+            for lbl in return_labels:
+                fmt[lbl] = lambda v: f"{v:+.1f}%" if pd.notna(v) else "N/A"
         if fmt:
             sty = sty.format(fmt)
         table = sty

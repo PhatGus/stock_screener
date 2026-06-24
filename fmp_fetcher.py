@@ -852,6 +852,7 @@ class FMPStockDataFetcher:
             'relative_strength_vs_voo_3m': np.nan,
             'volume_ratio_20d': np.nan,
             'momentum_12_1': np.nan,
+            'return_6m': np.nan, 'return_1yr': np.nan, 'return_3yr': np.nan,
         }
         current_price = _num(base.get('current_price'))
 
@@ -861,10 +862,17 @@ class FMPStockDataFetcher:
         if not pd.isna(ma200) and ma200 != 0 and not pd.isna(current_price):
             out['pct_above_200d_ma'] = (current_price - ma200) / ma200 * 100
 
+        # ~900 trading days (>3y) so the 3-year return is real; same single call.
         hist = self._get(V3_BASE, f"historical-price-full/{ticker}",
-                         ticker, {'timeseries': 400})
+                         ticker, {'timeseries': 900})
         closes = self._closes_from_history(hist)
         if closes is not None and len(closes) >= 2:
+            # Display-only trailing total returns (NOT scored). _period_return
+            # already returns a percentage, so no extra *100.
+            for key, months in (('return_6m', 6), ('return_1yr', 12), ('return_3yr', 36)):
+                r = self._period_return(closes, months)
+                out[key] = round(r, 2) if not pd.isna(r) else np.nan
+
             # 12-1 momentum: price return from ~12 months ago to ~1 month ago
             # (excludes the most recent month to avoid short-term reversal).
             p12 = self._price_at(closes, 12)
