@@ -210,54 +210,17 @@ def main():
         help="Only show stocks with positive forward revenue estimates"
     )
 
-    # Market cap filter
-    st.sidebar.subheader("Market Cap")
-    market_cap_options = {
-        "All Caps": 0,
-        "Micro Cap (>$50M)": 50e6,
-        "Small Cap (>$300M)": 300e6,
-        "Mid Cap (>$2B)": 2e9,
-        "Large Cap (>$10B)": 10e9,
-        "Mega Cap (>$100B)": 100e9,
-    }
-
-    selected_market_cap = st.sidebar.selectbox(
-        "Minimum Market Cap",
-        list(market_cap_options.keys()),
-        index=0,  # Default to All Caps (no cutoff)
-        help="Optional: filter by minimum market capitalization"
-    )
-    min_market_cap = market_cap_options[selected_market_cap]
-
-    # Valuation filters
-    st.sidebar.subheader("Valuation")
-    max_pe_ratio = st.sidebar.number_input(
-        "Max P/E Ratio",
-        min_value=0.0,
-        value=0.0,
-        step=10.0,
-        help="Optional: maximum price-to-earnings ratio (0 = no limit)"
-    )
+    # Market-cap, valuation (P/E) and sector filters removed: the tier selector
+    # handles market-cap segmentation and the hard gates handle valuation floors;
+    # sector filtering added complexity without clear value here.
+    min_market_cap = 0.0
+    max_pe_ratio = 0.0
+    exclude_sectors = []
 
     require_positive_earnings = st.sidebar.checkbox(
         "Profitable companies only",
         value=False,
         help="Only show companies with positive earnings"
-    )
-
-    # Sector filters
-    st.sidebar.subheader("Sector Filters")
-    sectors = [
-        "Technology", "Healthcare", "Financials", "Consumer Discretionary",
-        "Communication Services", "Industrials", "Consumer Staples",
-        "Energy", "Utilities", "Real Estate", "Materials"
-    ]
-
-    exclude_sectors = st.sidebar.multiselect(
-        "Exclude sectors",
-        sectors,
-        default=[],
-        help="Optional: sectors to exclude from screening (none by default)"
     )
 
     # Analyst coverage
@@ -707,6 +670,73 @@ GROWTH_TIER_COLUMN_ORDER = [
 ]
 
 
+# One-sentence tooltip per column (keyed by the displayed column label),
+# explaining why each factor matters for beating VOO.
+COLUMN_HELP = {
+    # Identity
+    'Ticker': 'Stock symbol',
+    'Company': 'Company name',
+    'Sector': 'GICS sector classification',
+    'Country': 'Country of domicile — non-US names carry currency and regulatory risk',
+    'Market Cap': 'Total market capitalization in USD',
+    'Tier': 'Screener tier: Core ($10B+), Growth ($1B-$10B), or Speculative ($250M-$1B)',
+    # Growth
+    'Rev Growth YoY %': 'Trailing 12-month revenue growth. Strong historical predictor of outperformance but backward-looking — pair with forward growth and deceleration signals',
+    'Fwd Rev Growth %': 'Analyst consensus estimate for next 12-month revenue growth. Most predictive single factor at the 12-month horizon — but quality depends on analyst coverage depth',
+    'Growth Decel': 'Forward growth minus trailing growth in percentage points. Negative = decelerating business. Below -15pp triggers a score penalty',
+    'Net Margin Trend': 'Direction of net profit margin change over the last 4 quarters. Expanding margins signal improving business quality and pricing power',
+    # Momentum
+    'Momentum 12-1': '12-month price return excluding the most recent month. One of the most robust factors in academic literature — avoids short-term reversal noise. Strong predictor at 12-month horizon',
+    'RS vs VOO 12m': 'Stock return minus VOO return over 12 months in percentage points. Positive = outperformed your benchmark. Used as display context, not scored',
+    'Return 6m': '6-month total price return. Context for recent trend direction',
+    'Return 1yr': '1-year total price return. Historical performance context — high correlation with past momentum, not a forward predictor',
+    'Return 3yr': '3-year total price return. Longer-term compounding track record',
+    # Quality
+    'Gross Margin': 'Revenue minus cost of goods as % of revenue, ranked within sector. The single best proxy for competitive moat and pricing power. 60%+ = strong moat. Sector-normalized so software is compared to software',
+    'gross_margin_expansion': 'Year-over-year change in gross margin. Expanding = strengthening competitive position. More predictive than the level alone at 24-36 month horizon',
+    'earnings_quality_ratio': 'Operating cash flow divided by net income. Ratio above 1.0 means earnings are backed by real cash. Below 1.0 = accrual-heavy earnings that tend to disappoint',
+    # Sentiment
+    'EPS Rev Net': 'Net analyst EPS estimate revisions (upgrades minus downgrades). Positive = Wall Street getting more bullish in real time. Strong 12-month predictor',
+    'Rev Est Revision': 'Change in consensus forward revenue estimate. Revenue revisions up = the growth story is getting stronger, not weaker',
+    'Buy %': 'Percentage of analysts with a Buy rating. Useful context but a lagging signal — analysts follow price more than they lead it',
+    '# Analysts': 'Number of analysts covering this stock. Low coverage = forward estimates are less reliable and are discounted in the composite score',
+    'Coverage Wt': 'Analyst coverage quality weight (0.20-1.00) applied to forward growth estimates. Low coverage stocks get discounted forward growth scores',
+    'Fwd Est Missing': 'True = no forward revenue estimate available. The screener applies a conservative -20pp deceleration assumption for these stocks',
+    'Beat Rate %': 'Percentage of last 4 quarters where actual EPS exceeded estimates. Habitual beaters have built-in positive sentiment drift',
+    # Profitability
+    'FCF Margin': 'Free cash flow as % of revenue, ranked within sector. Shows how much real cash the business generates per dollar of sales. More reliable than net income',
+    'Rule of 40': 'Revenue growth % + FCF margin %. The standard growth company benchmark. Above 40 = healthy. Above 60 = exceptional. Most relevant for software and tech',
+    'FCF Yield': 'Free cash flow divided by market cap. VOO yields ~3.5% — a stock above that with strong growth is generating real returns relative to your benchmark',
+    # Valuation
+    'Fwd P/E': 'Price divided by next 12 months earnings estimate. Lower is better — inverted in scoring. Less meaningful for high-growth names where EV/EBITDA is cleaner',
+    'EV/EBITDA': 'Enterprise value divided by EBITDA. Better than P/E for capital-structure-heavy companies. Inverted in scoring — lower is better',
+    # Risk / flow
+    'Short % Float': 'Percentage of float sold short. High short interest + strong results = potential squeeze. Also signals skepticism worth understanding. Inverted in scoring',
+    'Debt Trend': 'Year-over-year change in total debt. Rising debt during high-rate periods is a risk flag. Inverted in scoring — deleveraging is rewarded',
+    'Inst Own Δ': 'Change in institutional ownership between two most recent 13F filings. Rising = smart money accumulating. One of the cleaner flow signals',
+    'Insider $ Net 3m': 'Net dollar value of insider buying minus selling over 90 days, normalized by market cap. Dollar-weighted so a CEO buying $5M matters more than 10 employees buying $50K each',
+    # Flags
+    'Rate Sensitive': 'True = stock is materially exposed to interest rate moves (utilities, REITs, high leverage). Relevant for macro positioning',
+    'AI Infra': 'True = stock is part of the hyperscaler AI capex cycle (semis, networking). These names are correlated — owning multiple AI infrastructure names is less diversified than it looks',
+    'China ADR': 'True = Chinese-domiciled company trading as US ADR. Carries regulatory, delisting, and currency risk beyond normal equity risk',
+    'SEC Flag': 'True = recent 8-K filing contains keywords suggesting active investigation, class action, or regulatory inquiry within last 180 days',
+    # Scores
+    'Score 12m': 'Composite score optimized for 12-month outperformance vs VOO. Heavily weighted toward momentum and forward growth. Scale 0-100',
+    'Score 24m': 'Composite score optimized for 24-month outperformance vs VOO. Balanced between momentum/growth and quality/value signals. Scale 0-100',
+    'Score 36m': 'Composite score optimized for 36-month outperformance vs VOO. Heavily weighted toward FCF, valuation, and capital discipline. Momentum signals fade significantly. Scale 0-100',
+    'Data Qual': 'Percentage of the 20 scored factors that populated with real data (vs NaN). Below 50% = ⚠ score is based on incomplete information and should be interpreted cautiously',
+}
+
+# Display labels that should render as formatted NumberColumns (label -> format).
+_NUMBER_COLUMN_FORMATS = {
+    'Rev Growth YoY %': '%.1f%%',
+    'Buy %': '%.0f%%',
+    'Score 12m': '%.1f',
+    'Score 24m': '%.1f',
+    'Score 36m': '%.1f',
+}
+
+
 def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool,
                  sort_horizon: str = '12m', tier: str = 'growth'):
     """Display screening results"""
@@ -986,24 +1016,19 @@ def show_results(df: pd.DataFrame, show_scores: bool, export_csv: bool,
     except Exception:
         table = display_df  # fall back to unstyled if Styler unavailable
 
-    column_config = {
-        "Rev Growth YoY %": st.column_config.NumberColumn(
-            "Rev Growth YoY %",
-            help="Year-over-year revenue growth",
-            format="%.1f%%",
-        ),
-        "Buy %": st.column_config.NumberColumn(
-            "Buy %",
-            help="Percentage of analyst buy ratings",
-            format="%.0f%%",
-        ),
-    }
-    for lbl, hz in [('Score 12m', '12m'), ('Score 24m', '24m'), ('Score 36m', '36m')]:
-        if lbl in display_df.columns:
+    # Per-column tooltips (help text) for every displayed column, preserving the
+    # numeric formats on the percentage / score columns.
+    column_config = {}
+    for lbl in display_df.columns:
+        help_txt = COLUMN_HELP.get(lbl)
+        if help_txt is None:
+            continue
+        fmt_spec = _NUMBER_COLUMN_FORMATS.get(lbl)
+        if fmt_spec is not None:
             column_config[lbl] = st.column_config.NumberColumn(
-                lbl, help=f"{hz} horizon composite score (0-100, higher = better)",
-                format="%.1f",
-            )
+                lbl, help=help_txt, format=fmt_spec)
+        else:
+            column_config[lbl] = st.column_config.Column(lbl, help=help_txt)
 
     # Display the dataframe with formatting
     st.dataframe(
