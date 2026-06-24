@@ -313,6 +313,18 @@ class FMPStockDataFetcher:
         data.update(self._forward_estimates(ticker, quote))
         data.update(self._analyst_sentiment(ticker))
 
+        # Fix 1 (debug): /quote carries no analyst count on FMP, so resolve
+        # num_analysts as the MAX across the best available sources: quote,
+        # /analyst-estimates analyst count, and total analyst ratings. (Max
+        # avoids a weak row-count proxy shadowing a better source.)
+        num_analysts = max(
+            int(data.get('num_analysts') or 0),
+            int(data.get('number_of_analysts') or 0),
+            int(data.get('analyst_rating_count') or 0),
+        )
+        data['num_analysts'] = num_analysts
+        data['analyst_coverage_weight'] = self._coverage_weight(num_analysts)
+
         if self.enable_extended:
             data.update(self._extended_fields(ticker, data, quote))
 
@@ -353,18 +365,15 @@ class FMPStockDataFetcher:
         china_adr = (str(country).strip() in CHINA_COUNTRIES) or (ticker in CHINA_ADR_TICKERS)
 
         # Fix 1: analyst coverage discount for forward-looking estimate quality.
+        # /quote does NOT carry an analyst count on FMP, so this is usually empty
+        # here and gets resolved from /analyst-estimates in fetch_stock_data. We
+        # still try a few possible quote keys for robustness across plans.
         nanl = _num(quote.get('numberOfAnalystOpinions'))
+        for k in ('analystsCount', 'numberOfAnalysts', 'analystCount'):
+            if pd.isna(nanl):
+                nanl = _num(quote.get(k))
         num_analysts = int(nanl) if not pd.isna(nanl) else 0
-        if num_analysts >= 15:
-            acw = 1.0
-        elif num_analysts >= 10:
-            acw = 0.85
-        elif num_analysts >= 5:
-            acw = 0.65
-        elif num_analysts >= 2:
-            acw = 0.40
-        else:
-            acw = 0.20
+        acw = self._coverage_weight(num_analysts)
 
         # Fix 2: gross_margin and fcf_margin as BASE fields from /key-metrics-ttm
         # (direct TTM margins; avoids the income/cash-flow statement parse that
@@ -460,9 +469,19 @@ class FMPStockDataFetcher:
             out['forward_revenue_estimate'] = _num(cur.get('estimatedRevenueAvg'))
             if len(est) >= 2:
                 out['next_year_revenue_estimate'] = _num(est[1].get('estimatedRevenueAvg'))
-            n_analysts = cur.get('numberAnalystEstimatedRevenue') or \
-                cur.get('numberAnalystsEstimatedRevenue')
-            out['number_of_analysts'] = int(_num(n_analysts)) if not pd.isna(_num(n_analysts)) else 0
+            # Analyst count: FMP exposes it on the estimate row (field naming
+            # varies). Take the max across the candidate keys / rows; fall back
+            # to the number of estimate rows returned.
+            count_keys = ('numberAnalystEstimatedRevenue', 'numberAnalystsEstimatedRevenue',
+                          'numberAnalystEstimatedEps', 'numberAnalystsEstimatedEps')
+            counts = []
+            for row in est:
+                for k in count_keys:
+                    v = _num(row.get(k))
+                    if not pd.isna(v):
+                        counts.append(int(v))
+            n_est = max(counts) if counts else len(est)
+            out['number_of_analysts'] = int(n_est)
 
             # Forward P/E from current price / forward EPS estimate.
             fwd_eps = _num(cur.get('estimatedEpsAvg'))
@@ -508,6 +527,8 @@ class FMPStockDataFetcher:
             vals = [strong_buy, buy, hold, sell, strong_sell]
             vals = [0.0 if pd.isna(v) else v for v in vals]
             total = sum(vals)
+            # Total ratings count is a coverage-depth fallback for num_analysts.
+            out['analyst_rating_count'] = int(total)
             if total > 0:
                 buys = vals[0] + vals[1]
                 holds = vals[2]
@@ -547,6 +568,20 @@ class FMPStockDataFetcher:
             out['recent_downgrades'] = downs
 
         return out
+
+    @staticmethod
+    def _coverage_weight(num_analysts: int) -> float:
+        """Analyst-coverage discount factor for forward-estimate quality (Fix 1)."""
+        n = num_analysts or 0
+        if n >= 15:
+            return 1.0
+        if n >= 10:
+            return 0.85
+        if n >= 5:
+            return 0.65
+        if n >= 2:
+            return 0.40
+        return 0.20
 
     @staticmethod
     def _rec_key(mean: float) -> str:
@@ -1081,9 +1116,40 @@ class FMPStockDataFetcher:
         return pd.DataFrame(results)
 
 
+def debug_analyst_coverage(tickers=('AAPL', 'MSFT', 'AMPX')):
+    """Debug/startup validation for the analyst-count field mapping (Fix 1).
+
+    Prints the raw /quote keys for AAPL (to see what FMP actually returns) and
+    the resolved analyst count + coverage weight for each ticker.
+    """
+    fetcher = FMPStockDataFetcher(use_cache=False)
+
+    # Show the raw /quote response keys for AAPL.
+    q = _first(fetcher._get(V3_BASE, "quote/AAPL", "AAPL"))
+    print("Raw /quote/AAPL keys:", sorted(q.keys()) if isinstance(q, dict) else q)
+    if isinstance(q, dict):
+        for k in ('numberOfAnalystOpinions', 'analystsCount', 'numberOfAnalysts'):
+            print(f"   quote['{k}'] = {q.get(k)}")
+
+    print("\n=== Analyst coverage validation ===")
+    print(f"{'ticker':8}{'num_analysts':>14}{'coverage_weight':>18}")
+    for tk in tickers:
+        data = fetcher.fetch_stock_data(tk) or {}
+        print(f"{tk:8}{data.get('num_analysts', 0):>14}"
+              f"{data.get('analyst_coverage_weight', 0):>18.2f}")
+
+
 if __name__ == "__main__":
     # Quick coverage validation (requirement 9).
     import sys
+
+    if '--analysts' in sys.argv:
+        try:
+            debug_analyst_coverage()
+        except RuntimeError as e:
+            print(f"ERROR: {e}")
+            sys.exit(1)
+        sys.exit(0)
 
     test_tickers = ['NVDA', 'AAPL', 'MSFT', 'JPM', 'VST']
     print("=== FMP Fetcher Validation ===")
