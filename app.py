@@ -387,23 +387,21 @@ def show_welcome_screen():
 
     st.subheader("📋 How to Use")
     st.markdown("""
-    1. **Select Universe**: Choose from S&P 500, NASDAQ 100, or full universe
-    2. **Set Criteria**: Adjust revenue growth, market cap, and other filters
-    3. **Run Screener**: Click the button to start screening
-    4. **Analyze Results**: Sort and filter the results table
-    5. **Export Data**: Download results as CSV for further analysis
+    1. **Pick a Tier**: Core ($10B+), Growth ($1B–$10B), or Speculative ($250M–$1B)
+    2. **Tune Gates** (optional): adjust the hard universe exclusion thresholds
+    3. **Run Screener**: screen the selected tier, or *Run All Tiers* for a cross-tier view
+    4. **Analyze Results**: sort by 12m / 24m / 36m horizon score
+    5. **Export Data**: download results as CSV for further analysis
     """)
 
-    st.subheader("🎯 Default Screening Criteria")
+    st.subheader("🎯 How Tiers Work")
     st.markdown("""
-    - **Revenue Growth**: >20% year-over-year
-    - **Market Cap**: >$2 billion (Mid Cap+)
-    - **P/E Ratio**: <100
-    - **Excluded Sectors**: Utilities, Real Estate
-    - **Analyst Coverage**: Required
+    - **Market-cap segmentation** is handled by the tier you choose
+    - **Valuation floors** are handled by the per-tier hard gates (EV/EBITDA, FCF, forward growth)
+    - **Scoring** uses tier-specific factor weights across three horizons (12m / 24m / 36m)
     """)
 
-    st.info("💡 **Tip**: Start with S&P 500 for faster results, then expand to full universe for comprehensive screening")
+    st.info("💡 **Tip**: Growth is the default tier. Use *Run All Tiers* to compare the best opportunities across the whole market-cap spectrum.")
 
 
 def run_screening(
